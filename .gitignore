@@ -1,0 +1,17 @@
+# Сборка PlatformIO
+.pio/
+
+# Python
+__pycache__/
+*.pyc
+
+# work: только файлы в корне папки, подпапки - нет
+work/*/
+
+# Журнал печати корпуса - внутренний (скилл enclosure)
+Build/enclosure/Print settings/
+
+# Настройки редактора и ОС
+.vscode/
+Thumbs.db
+desktop.ini
