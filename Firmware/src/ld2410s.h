@@ -33,7 +33,8 @@ bool ldReadSerial(char sn[LD_SN_LEN + 1]);                          // 0x0011: �
 bool ldReadParams(const uint16_t* words, uint8_t count, uint32_t* out);   // 0x0071: значения слов (табл. 2-2)
 bool ldEndConfig();                                                 // 0x00FE
 bool ldSetStandardMode(bool standard);                              // 0x007A
-bool ldWriteParams(uint8_t farGate, uint32_t offDelayS);           // 0x0070: слова 0x05 (если не 0), 0x06
+bool ldWriteParams(uint8_t farGate, uint32_t offDelayS);           // 0x0070: слова 0x05 (если не 0), 0x06, 0x0B
+bool ldWriteParam(uint16_t word, uint32_t value);                  // 0x0070: одно слово (табл. 2-2)
 bool ldStartAutoThreshold(uint16_t trig, uint16_t hold, uint16_t scanS);  // 0x0009
 bool ldReadThresholds(uint16_t cmd, uint32_t out[SENSOR_GATES]);    // 0x0073 / 0x0077
 bool ldWriteThresholds(uint16_t cmd, const uint32_t in[SENSOR_GATES]);    // 0x0072 / 0x0076

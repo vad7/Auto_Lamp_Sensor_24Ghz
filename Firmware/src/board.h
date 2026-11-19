@@ -10,9 +10,10 @@
 #endif
 
 // Состояния индикатора: на RP2040-Zero - цвет WS2812B, на одноцветных платах ESP32 - свечение / мигание
-enum class Led : uint8_t { Off, Red, Green, Blue, CalLeave, NoSensor, SupplyFault };   // CalLeave - пауза перед
-    // калибровкой (красный / зелёный), NoSensor - ошибка калибровки / нет связи с датчиком, SupplyFault - обрыв D1,
-    // Blue - вспышки
+enum class Led : uint8_t { Off, Red, Green, Blue, CalLeave, NoSensor, SupplyFault, StuckFlash };   // CalLeave -
+    // пауза перед калибровкой (красный / зелёный), NoSensor - ошибка калибровки / нет связи с датчиком, SupplyFault -
+    // обрыв D1, Blue - вспышки, StuckFlash - залипание датчика (белая вспышка LED_STUCK_FLASH_MS раз в
+    // LED_STUCK_PERIOD_MS)
 
 // Данные калибровки, хранятся во флеш-памяти МК. Не упакована: на Cortex-M0+ невыровненный доступ к uint32_t -
 // аварийная остановка; поля расставлены без выравнивающих пропусков.
@@ -29,21 +30,40 @@ struct Calib {
     uint8_t  nightPct[NIGHT_LEVEL_COUNT];   // ночник: яркость уровней, % (заполнение ШИМ); уровень 0 - минимум при перегреве
     int8_t   tempMax;               // ночник: порог перегрева, °C (с поправкой NIGHT_TEMP_OFFSET_C)
     uint16_t minOnS;                // свет горит не меньше, с, от последнего «человек есть» на OT2 (против дребезга)
+    uint16_t lightDarkLevel;        // калибровка: свет «темно» (шаг 1), отсчёты АЦП; 0 и lightLitLevel 0 - не мерили
+    uint16_t lightLitLevel;         // калибровка: свет «светло» (шаг 2), отсчёты АЦП
+    uint16_t stuckMinutes;          // залипание: лампа горит без перерыва, мин; 0 - не проверять
+    uint8_t  stuckLightPct;         // залипание: свет не меняется в пределах % от |lightLitLevel - lightDarkLevel|
+    uint8_t  stuckDeltaDb;          // залипание: лампа вкл, если энергия ворот выше фона на, дБ
+    uint32_t nightPwmHz;            // ночник: частота ШИМ, Гц: NIGHT_PWM_HZ_MIN..NIGHT_PWM_HZ_MAX (консоль pwm)
+    uint8_t  standbyLevel;          // ночник: дежурная подсветка - 0 выкл, 1..STANDBY_LEVEL_COUNT - уровень
+    uint8_t  standbyPct[STANDBY_LEVEL_COUNT];   // ночник: яркость уровней дежурки, %
+    uint16_t standbyOnThreshold;    // дежурка не горит: включить, если темнее, отсчёты АЦП
+    uint16_t standbyOffThreshold[STANDBY_LEVEL_COUNT];   // дежурка горит на уровне (её свет на фоторезисторе):
+                                                         // погасить, если светлее, отсчёты АЦП
+    uint16_t lightThresholdStandby[STANDBY_LEVEL_COUNT]; // порог основного света, пока горит дежурка на уровне
+                                                         // (фоторезистор видит её), отсчёты АЦП
+    uint16_t lightStandbyLevel[STANDBY_LEVEL_COUNT];     // калибровка: «темно» с дежуркой на уровне, отсчёты АЦП;
+                                                         // 0 - не мерили
 };
 
-// Пороги датчика заданы калибровкой (или консолью trig): порог 0 не бывает (диапазон 10..95 дБ, программа HLK).
+// Пороги датчика заданы калибровкой (или консолью «G: T / H»): порог 0 не бывает (диапазон 10..95 дБ, программа HLK).
 inline bool sensorCalibrated(const Calib& c) {
     return c.trig[0] != 0;
 }
 
 constexpr uint32_t CALIB_MAGIC   = 0x4C414D50;  // «LAMP»
-constexpr uint16_t CALIB_VERSION = 5;           // менять при изменении Calib
+constexpr uint16_t CALIB_VERSION_NO_PWM = 6;    // прежняя версия: структура до nightPwmHz - переводится при загрузке
+constexpr uint16_t CALIB_VERSION_NO_STANDBY = 7;   // прежняя версия: структура до standbyLevel - переводится при загрузке
+constexpr uint16_t CALIB_VERSION_ONE_STANDBY = 8;  // прежняя версия: пороги дежурки одни на все уровни - при загрузке
+                                                   // уровень и проценты дежурки остаются, пороги - заново от света
+constexpr uint16_t CALIB_VERSION = 9;       // менять при изменении Calib
 
 Stream*  boardConsoleOpen();                 // при включении: перемычка USB замкнута - индикатор (синий), поток
                                              // консоли; перемычки нет - nullptr
 bool     boardConsoleConnected();            // монитор порта USB ещё открыт
 #ifdef NIGHT_LIGHT
-void     boardConsoleLamp(uint8_t percent);  // консоль: ночник с яркостью, % (0 - выкл); до boardInit
+void     boardLampFreq(uint32_t hz);         // ночник: частота ШИМ, Гц, ночник гаснет; после boardInit - снова
 #endif
 void     boardInit();                        // такты (USB выкл), пины, индикатор
 void     boardSleep(uint32_t ms, bool deep);  // ожидание; deep - сон с остановкой тактов (UART не работает)

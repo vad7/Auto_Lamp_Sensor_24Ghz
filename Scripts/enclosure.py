@@ -7,7 +7,8 @@
 # Лицевая сторона крышки - плоскость Z = 0, корпус уходит в минус Z; «глубина» d = -Z (от лица внутрь).
 # Детали: body - основание (к стене) со стенками, печать основанием на стол; cover - лицевая крышка
 # (4 самореза спереди); diffuser - рассеиватель COB (вклеивается в выемку, пока - печатная пластина);
-# clamp - прижимная пластина платы (2 шт.: LD2410S и RP2040-Zero, саморез 2,5 в стойку).
+# clamp - прижимная пластина платы (2 шт.: LD2410S и RP2040-Zero, саморез 2,5 в стойку); holder - T-держатель
+# на стену для корпуса COB вниз (в модели - в системе корпуса).
 import json
 import math
 import os
@@ -50,6 +51,8 @@ SCREW_L = 8.0           # саморез 2,5 x 8 (задал пользоват�
 SCREW_HOLE_D = 2.9      # отверстие под саморез в крышке и пластине, мм
 SCREW_HEAD_D = 5.2      # потай: диаметр зенковки 90°, мм
 SINK = (SCREW_HEAD_D - SCREW_HOLE_D) / 2   # глубина зенковки, мм
+COVER_RIB_T = GUIDE_T   # рёбра жёсткости крышки по краям (крышка гнулась - пользователь): толщина, мм
+COVER_RIB_H = 3.0       # высота рёбер от внутренней стороны крышки, мм (выбрал ассистент; дальше - платы и выводы)
 
 # ---------------- PARAMETERS: ввод провода (выдавливаемые карманы) ----------------
 KO_D = 6.5              # диаметр под провод 6 мм (задал пользователь), мм
@@ -116,10 +119,12 @@ C_MM = 299.792458e9     # скорость света, мм/с
 RADOME_ER = 2.8         # проницаемость ABS (пластик задал пользователь) - ОЦЕНКА: TI SWRA705 табл. 3-1 - ABS 2,0-3,5,
                         # гл. 5 - ABS-HG_FR 2,8 (взят он)
 LAMBDA0 = C_MM / F_RADAR                           # длина волны в воздухе, мм
-RADOME_T = LAMBDA0 / (2 * math.sqrt(RADOME_ER))    # стенка перед антенной λm/2 (SWRA705 гл. 2.3), мм
-RADOME_GAP = LAMBDA0 / 2                           # антенна - стенка λ0/2 (SWRA705 гл. 2.4), мм
+RADOME_T = LAMBDA0 / (2 * math.sqrt(RADOME_ER))    # прежняя стенка перед антенной λm/2 (SWRA705 гл. 2.3), мм: от неё
+                                                   # считаны глубина антенны и упоры COB - корпус не меняется
+RADOME_GAP = LAMBDA0 / 2                           # антенна - прежняя стенка λ0/2 (SWRA705 гл. 2.4), мм
 ANT_D = RADOME_T + RADOME_GAP                      # глубина лица антенны, мм
-RADOME_MARGIN = 1.5     # утолщение крышки шире платы на (сверху - до профиля COB), мм
+RADOME_WALL = 0.7       # крышка перед антенной, мм (пользователь, белый ABS): с утолщением λm/2 датчик срабатывал через
+                        # ~2 с, без крышки - сразу; выемка изнутри по плате радара, в обход рёбер
 RADAR_SO_X = 18.5       # стойка радара: x от левого угла платы (у правого угла - мимо фоторезистора), мм
 RADAR_CHAMFER = 3.0     # скос левого нижнего угла пластины радара (к трубке фоторезистора), катет, мм
 
@@ -184,6 +189,25 @@ PB_SCREW_OFF = (1.85, 2.1)   # крепёжное отверстие макет�
                              # ОЦЕНКА по фото; диаметр по фото около 2,3 - тесно для 2,5: рассверлить до 2,7
 PB_PILOT = PB_RAISE + T_BACK - 0.5   # пилот: через опору в основание, снаружи 0,5 мм, мм
 PB_ZONE_GAP = 0.5       # детали на макетке: зазор до платы RP2040-Zero, мм
+
+# ---------------- PARAMETERS: T-держатель (корпус COB вниз, держатель саморезами на стену) ----------------
+# Пластина T за основанием: перекладина - «руки», загнуты вперёд по боковым стенкам, с зацепом на лицо крышки; ножка -
+# вниз (к COB) с полочкой под корпусом. Модель - в системе корпуса (COB вверху, +Y): в работе всё повёрнуто на 180°
+# вокруг Z. Корпус вставляется сверху (в работе) между руками до полочки. Печать - пластиной на стол, руки и полочка вверх.
+HOLDER_T = 3.0          # толщина, мм (пользователь)
+HOLDER_W = 10.0         # ширина рук, мм (пользователь)
+HOLDER_STEM_W = 14.0    # ширина ножки и полочки, мм (пользователь; было 10)
+HOLDER_BRACE_IN = 0.0   # косое утолщение перекладины к ножке начинается от внутренней грани рук на, мм (пользователь;
+                        # было 3)
+HOLDER_BRACE_W = 16.0   # ширина перекладины у ножки (пользователь; было 14) (низ - по прямой от HOLDER_W), мм (пользователь): прочнее у отверстий
+HOLDER_KO_GAP = 1.0     # руки дальше от COB, чем отверстие у HLK, на, мм (пользователь; было 3)
+HOLDER_PRELOAD = 0.2    # натяг зацепа на край крышки, мм (пользователь: болтался - было 0,75 мм люфта): руки пружинят
+HOLDER_LIP = 2.0        # зацеп рук на лицо крышки, вылет внутрь, мм (выбрал ассистент): низ - откос SLOPE (печать без
+                        # поддержек), касается края крышки - держит корпус от наклона от стены
+HOLDER_LIP_TOP = 1.0    # толщина зацепа у кончика, мм
+HOLDER_SHELF = 5.0      # полочка под корпусом, вылет от основания, мм: под сплошной частью стенки за окном COB
+HOLDER_SCREW_D = 3.5    # отверстие под саморез в стену, мм (выбрал ассистент: саморез 3-3,5 под дюбель)
+HOLDER_HEAD_D = 7.0     # потай под голову, мм (зенковка 90° со стороны корпуса - голова заподлицо)
 
 # Платы: (x0, y0, ширина, высота, глубина лица, толщина, крючки, x стойки от левого угла,
 #         скос левого нижнего угла пластины)
@@ -361,10 +385,10 @@ def make_cover():
     for x, y in boss_xy():
         cover = cover.cut(cyl(x, y, SCREW_HOLE_D, -1, T_FRONT + 1)).cut(countersink(x, y, 0))
 
-    # LD2410S: утолщение λm/2 перед антенной (в пределах внутреннего контура стенок)
-    inner = rrect(W - 2 * (T_WALL + FIT), H - 2 * (T_WALL + FIT), R - T_WALL - FIT, T_FRONT - 0.01, RADOME_T)
-    cover = cover.union(blk(RX0 - RADOME_MARGIN, RX0 + RADAR_S + RADOME_MARGIN, RY0 - RADOME_MARGIN,
-                            RY0 + RADAR_S + RADOME_MARGIN, T_FRONT - 0.01, RADOME_T).intersect(inner))
+    # LD2410S: тонкая стенка RADOME_WALL перед антенной - выемка изнутри по плате радара, в обход рёбер
+    o = T_WALL + FIT + COVER_RIB_T
+    cover = cover.cut(blk(RX0, RX0 + RADAR_S, RY0, RY0 + RADAR_S, RADOME_WALL, T_FRONT + 0.01)
+                      .intersect(rrect(W - 2 * o, H - 2 * o, R - o, 0, T_FRONT + 0.01)))
 
     # Фоторезистор: гнездо + трубка; снаружи - плёнка LED_WIN_T, как окно индикатора (закрыто от пыли и влаги,
     # пользователь; пропускание плёнки ABS - не известно, проверить перепад «темно / светло» в консоли show)
@@ -374,6 +398,16 @@ def make_cover():
 
     # HLK-5LD05: штырь до лица модуля с выводами - прижимает модуль к основанию
     cover = cover.union(cyl(HLK_X0 + HLK_S / 2, HLK_Y0 + HLK_S / 2, HLK_PRESS_D, T_FRONT - 0.01, DB - HLK_H))
+
+    # Рёбра жёсткости по краям: изнутри вдоль стенок (зазор FIT), в обход стоек саморезов и выемки рассеивателя COB
+    o = T_WALL + FIT
+    d1 = T_FRONT + COVER_RIB_H
+    rib = rrect(W - 2 * o, H - 2 * o, R - o, T_FRONT - 0.01, d1).cut(
+        rrect(W - 2 * (o + COVER_RIB_T), H - 2 * (o + COVER_RIB_T), R - o - COVER_RIB_T, T_FRONT - 1, d1 + 1))
+    for x, y in boss_xy():
+        rib = rib.cut(cyl(x, y, 2 * (BOSS_R + FIT), 0, d1 + 1))
+    by = max(y for _, y in boss_xy())      # сверху ребра нет: выемка рассеивателя COB во всю ширину между стойками
+    cover = cover.union(rib.cut(blk(-W, W, by, H, 0, d1 + 1)))
 
     # Индикатор: окно в один слой с откосом к полной толщине, не заходит на опору фланца колпачка BOOT;
     # кнопка BOOT: отверстие под печатную кнопку
@@ -415,6 +449,56 @@ def make_button():
     cap_end = RP_D - BTN_H
     stem = cyl(bx, by, CAP_D, -CAP_OUT, cap_end - CAP_FL_T + 0.01).edges(">Z").fillet(CAP_TOP_R)
     return stem.union(cyl(bx, by, CAP_FL_D, cap_end - CAP_FL_T, cap_end))
+
+
+def holder_arm_y():
+    """Руки T-держателя по Y (система корпуса): от отверстия у HLK на HOLDER_KO_GAP дальше от COB."""
+    y1 = KO_SIDE_Y - KO_D / 2 - HOLDER_KO_GAP
+    return y1 - HOLDER_W, y1
+
+
+def holder_screws():
+    """Саморезы в стену: на концах и в центре перекладины (между рук - пользователь), внизу ножки (у полочки)."""
+    ya0, _ = holder_arm_y()
+    xb = W / 2 + FIT - HOLDER_BRACE_IN   # начало скоса перекладины
+    sw = HOLDER_STEM_W / 2
+
+    def mid(x):   # середина ширины перекладины в точке x (со скосом к ножке) - отверстие по центру (пользователь)
+        k = min(max((xb - abs(x)) / (xb - sw), 0.0), 1.0)
+        return ya0 + (HOLDER_W + (HOLDER_BRACE_W - HOLDER_W) * k) / 2
+
+    xs = W / 2 - 12.0
+    return [(-xs, mid(xs)), (0.0, mid(0.0)), (xs, mid(xs)), (0.0, H / 2 - 8.0)]
+
+
+def make_holder():
+    ya0, ya1 = holder_arm_y()
+    t = HOLDER_T
+    xo, xt = W / 2 + FIT, W / 2 + FIT + t             # руки: внутренняя и наружная грань по X
+    d0 = HOLDER_PRELOAD + FIT * SLOPE                   # низ зацепа у грани руки: откос заходит на край крышки (x = W/2)
+                                                        # на HOLDER_PRELOAD
+    d_top = d0 - HOLDER_LIP * SLOPE - HOLDER_LIP_TOP    # верх рук (перед лицом крышки), глубина
+    sw = HOLDER_STEM_W / 2
+    xb = xo - HOLDER_BRACE_IN                       # начало косого утолщения перекладины
+    yb = ya0 + HOLDER_BRACE_W                       # низ перекладины у ножки (к COB)
+    plate = [(-xt, ya0), (xt, ya0), (xt, ya1), (xb, ya1), (sw, yb), (sw, H / 2 + t), (-sw, H / 2 + t), (-sw, yb),
+             (-xb, ya1), (-xt, ya1)]   # T: перекладина с косыми утолщениями к ножке, ножка
+    h = cq.Workplane("XY").polyline(plate).close().extrude(t).translate((0, 0, -(D + t)))
+    h = h.union(blk(-sw, sw, H / 2, H / 2 + t, D - HOLDER_SHELF, D + t))   # полочка под корпусом
+    for s in (-1, 1):
+        a, b = sorted((s * xo, s * xt))
+        h = h.union(blk(a, b, ya0, ya1, d_top, D + 0.01))                  # рука вдоль боковой стенки
+        # Зацеп на лицо крышки: сечение (x, d), низ - откос от грани руки (зазор FIT) к кончику
+        pts = [(xo, d0), (xo - HOLDER_LIP, d0 - HOLDER_LIP * SLOPE), (xo - HOLDER_LIP, d_top), (xo + 0.01, d_top),
+               (xo + 0.01, d0)]
+        lip = cq.Workplane("XZ").polyline([(s * x, -d) for x, d in pts]).close().extrude(HOLDER_W)
+        bb = lip.val().BoundingBox()
+        h = h.union(lip.translate((0, ya0 - bb.ymin, 0)))
+    for x, y in holder_screws():
+        cone = cq.Solid.makeCone(HOLDER_HEAD_D / 2, HOLDER_SCREW_D / 2, (HOLDER_HEAD_D - HOLDER_SCREW_D) / 2,
+                                 cq.Vector(x, y, -D + 0.01), cq.Vector(0, 0, -1))
+        h = h.cut(cq.Workplane().add(cone)).cut(cyl(x, y, HOLDER_SCREW_D, D - 1, D + t + 1))
+    return h
 
 
 def make_components():
@@ -485,6 +569,11 @@ def slice_checks(printed):
     print("[срезы %.2f/%.2f] кожа кармана на стену %.1f мм, слоёв %s: %s" %
           (SLICE_FIRST, SLICE_LAYER, KO_SKIN, counts, "OK" if s_ok else "ЕСТЬ ПРОБЛЕМЫ"))
     ok &= s_ok
+    counts = slices_with_material(printed["cover"], RX0 + RADAR_S / 2, RY0 + RADAR_S / 2, RADOME_WALL, lambda z: z)
+    s_ok = min(counts) >= 2   # стенка перед радаром - не меньше двух слоёв (пользователь)
+    print("[срезы %.2f/%.2f] стенка перед радаром %.2f мм, слоёв %s: %s" %
+          (SLICE_FIRST, SLICE_LAYER, RADOME_WALL, counts, "OK" if s_ok else "ЕСТЬ ПРОБЛЕМЫ"))
+    ok &= s_ok
     for name, width, lines in (("кожа карманов у HLK", KO_SKIN, 1),
                                ("кольцо под фланец BOOT", (CAP_FL_D - CAP_HOLE_D) / 2, 2)):
         s_ok = width >= lines * SLICE_LINE
@@ -497,12 +586,13 @@ def build_one():
     os.makedirs(OUT, exist_ok=True)
     ok = True
     printed = {"body": make_body(), "cover": make_cover(), "diffuser": make_diffuser(), "boot_cap": make_button(),
-               "clamp_radar": make_clamp(MOUNTS["radar"]), "clamp_rp": make_clamp(MOUNTS["rp"])}
+               "clamp_radar": make_clamp(MOUNTS["radar"]), "clamp_rp": make_clamp(MOUNTS["rp"]),
+               "holder": make_holder()}
     comps = make_components()
 
     print("[габарит] %.0f x %.0f x %.0f мм, углы R%.0f; внутри по глубине %.1f мм" % (W, H, D, R, DB - T_FRONT))
-    print("[радар] λ0 %.2f мм; стенка перед антенной %.2f мм (ε %.1f - оценка), зазор %.2f мм" %
-          (LAMBDA0, RADOME_T, RADOME_ER, RADOME_GAP))
+    print("[радар] λ0 %.2f мм; стенка перед антенной %.2f мм, антенна от неё %.2f мм" %
+          (LAMBDA0, RADOME_WALL, ANT_D - RADOME_WALL))
     print("[COB] окно %.0f x %.0f мм, рассеиватель %.0f x %.0f x %.1f мм + выступ в окно %.1f мм "
           "(diffuser_abs - без выступа), без рифов" %
           (2 * WIN_HALF, WIN_D1 - T_FRONT, 2 * DIFF_HALF, DIFF_D1 - T_FRONT - 0.1, DIFF_T, DIFF_PLUG))
@@ -511,7 +601,8 @@ def build_one():
     allp = dict(printed)
     allp.update(comps)
     names = list(allp)
-    touch = ({"cob", "profile"}, {"rp2040zero", "boot_cap"})   # COB на профиле, кнопка на кнопке платы - по замыслу
+    touch = ({"cob", "profile"}, {"rp2040zero", "boot_cap"},   # COB на профиле, кнопка на кнопке платы - по замыслу
+             {"holder", "cover"})                               # натяг зацепов держателя - отдельная проверка 2е
     for i, a in enumerate(names):
         for b in names[i + 1:]:
             v = vol(allp[a], allp[b])
@@ -521,7 +612,7 @@ def build_one():
     print("[зазоры] детали и корпус: %s" % ("OK" if ok else "ЕСТЬ ПРОБЛЕМЫ"))
 
     # 2. Между антенной и крышкой - никаких покупных (металлических) деталей (руководство LD2410S гл. 10)
-    zone = blk(RX0, RX0 + RADAR_S, RY0, RY0 + RADAR_S, RADOME_T + 0.01, ANT_D - 0.01)
+    zone = blk(RX0, RX0 + RADAR_S, RY0, RY0 + RADAR_S, RADOME_WALL + 0.01, ANT_D - 0.01)
     bad = [n for n, s in comps.items() if n != "ld2410s" and vol(zone, s) > CHECK_VOL]
     print("[радар] перед антенной пусто: %s" % ("OK" if not bad else "ЕСТЬ ПРОБЛЕМЫ " + ", ".join(bad)))
     ok &= not bad
@@ -556,6 +647,25 @@ def build_one():
     print("[крепёж] отверстия в крышке сквозные: %s" % ("OK" if v <= CHECK_VOL else "ЕСТЬ ПРОБЛЕМЫ %.2f мм³" % v))
     ok &= v <= CHECK_VOL
 
+    # 2е. T-держатель: отверстие под провод у HLK открыто (провод выходит наружу), окно COB не закрыто полочкой,
+    # корпус проходит между зацепами рук (вставляется вдоль Y)
+    ya0, ya1 = holder_arm_y()
+    hole = (cq.Workplane("YZ").workplane(offset=W / 2 - 1).center(KO_SIDE_Y, -KO_DEPTH)
+            .circle(KO_D / 2 + HOLDER_KO_GAP / 2).extrude(30))
+    v_ko = vol(hole, printed["holder"])
+    v_win = vol(blk(-WIN_HALF, WIN_HALF, H / 2 - 0.01, H / 2 + 10, -1, WIN_D1), printed["holder"])
+    # Натяг: клин откоса зацепа на краю крышки, обе руки (сечение - треугольник PRELOAD x PRELOAD / SLOPE)
+    v_pre = 2 * HOLDER_W * HOLDER_PRELOAD * (HOLDER_PRELOAD / SLOPE) / 2
+    v_cov = vol(printed["cover"], printed["holder"])   # на месте
+    v_pass = vol(rrect(W, H, R, 0, D).translate((0, -15.0, 0)), printed["holder"])   # корпус на полпути в руках
+    pre_ok = v_cov <= 2 * v_pre and v_pass <= 2 * v_pre
+    print("[держатель] руки %.1f..%.1f мм от COB-края (в работе - снизу), отверстие у HLK %.1f мм (до рук %.1f): "
+          "свободно %s; окно COB: %s; натяг зацепов %.1f мм (пересечение %.2f / %.2f мм³, расчёт %.2f): %s" %
+          (H / 2 - ya1, H / 2 - ya0, H / 2 - KO_SIDE_Y, HOLDER_KO_GAP,
+           "OK" if v_ko <= CHECK_VOL else "НЕТ", "OK" if v_win <= CHECK_VOL else "ЗАКРЫТО",
+           HOLDER_PRELOAD, v_cov, v_pass, v_pre, "OK" if pre_ok else "ЕСТЬ ПРОБЛЕМЫ"))
+    ok &= v_ko <= CHECK_VOL and v_win <= CHECK_VOL and pre_ok
+
     # 3. Саморезы: длина в стойке не больше пилота (крышка, прижимная пластина - потай; макетка - без зенковки)
     for name, length, t, pilot in (("крышка", SCREW_L, T_FRONT - SINK, PILOT_DEPTH),
                                    ("пластина", SCREW_L, CLAMP_T - SINK, PILOT_DEPTH),
@@ -576,6 +686,7 @@ def build_one():
         "boot_cap": printed["boot_cap"],                                       # фланцем на стол
         "clamp_radar": printed["clamp_radar"],                                 # зенковкой вверх
         "clamp_rp": printed["clamp_rp"],                                       # зенковкой вверх
+        "holder": printed["holder"],                                           # пластиной на стол, руки и полочка вверх
     }
     for n, s in place.items():
         bb = s.val().BoundingBox()
@@ -595,8 +706,8 @@ def build_one():
         asm.add(s, name=n)
     asm.save(os.path.join(OUT, "_assembly.step"))
     layout(printed, comps, os.path.join(OUT, "_layout.png"))
-    json.dump({"outer_mm": [W, H, D], "corner_r": R, "inner_depth": DB - T_FRONT, "radome_t": round(RADOME_T, 2),
-               "radome_gap": round(RADOME_GAP, 2), "screws": "2.5x%.0f x6 (крышка 4, пластины 2), потай" % SCREW_L},
+    json.dump({"outer_mm": [W, H, D], "corner_r": R, "inner_depth": DB - T_FRONT, "radome_wall": RADOME_WALL,
+               "antenna_gap": round(ANT_D - RADOME_WALL, 2), "screws": "2.5x%.0f x6 (крышка 4, пластины 2), потай" % SCREW_L},
               open(os.path.join(OUT, "_dims.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     return ok
 
@@ -611,7 +722,7 @@ def layout(printed, comps, path):
     colors = {"body": "#d0d0d0", "cover": "#b0c4de", "diffuser": "#fff3b0", "clamp_radar": "#8c564b",
               "clamp_rp": "#8c564b", "ld2410s": "#3a7bd5","rp2040zero": "#2e8b57",
               "boot_cap": "#d62728", "hlk5ld05": "#444444", "profile": "#9aa5b1", "cob": "#ffcc00",
-              "protoboard": "#c8a165"}
+              "protoboard": "#c8a165", "holder": "#6a3d9a"}
 
     def polys(shape, proj):
         verts, faces = cq.Compound.makeCompound(shape.vals()).tessellate(0.2)

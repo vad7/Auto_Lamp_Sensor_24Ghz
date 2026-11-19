@@ -18,6 +18,7 @@ constexpr uint8_t  STD_ENERGY_OFFSET = 6;  // смещение энергий в
                                            // расстояние(2), резерв(2)
 constexpr uint16_t PAR_FAR_GATE  = 0x05;   // слово «дальние ворота» (табл. 2-2)
 constexpr uint16_t PAR_OFF_DELAY = 0x06;   // слово «время без человека», с (табл. 2-2)
+constexpr uint16_t PAR_RESPONSE_SPEED = 0x0B;   // слово «скорость отклика» (табл. 2-2)
 
 static Stream* s_uart = nullptr;           // UART датчика
 static uint8_t s_buf[FRAME_MAX];           // собираемый кадр
@@ -233,7 +234,7 @@ bool ldSetStandardMode(bool standard) {
 }
 
 bool ldWriteParams(uint8_t farGate, uint32_t offDelayS) {
-    uint8_t v[12];
+    uint8_t v[18];
     uint8_t len = 0;
     if (farGate) {   // 0 - дальние ворота не писать (заводские); пар «слово + значение» - любое число (инстр. п. 2.2.7)
         wr16(v, PAR_FAR_GATE);
@@ -242,7 +243,16 @@ bool ldWriteParams(uint8_t farGate, uint32_t offDelayS) {
     }
     wr16(v + len, PAR_OFF_DELAY);
     wr32(v + len + 2, offDelayS);
-    return command(0x0070, v, len + 6);
+    wr16(v + len + 6, PAR_RESPONSE_SPEED);
+    wr32(v + len + 8, SENSOR_RESPONSE_SPEED);
+    return command(0x0070, v, len + 12);
+}
+
+bool ldWriteParam(uint16_t word, uint32_t value) {
+    uint8_t v[6];
+    wr16(v, word);
+    wr32(v + 2, value);
+    return command(0x0070, v, sizeof(v));
 }
 
 bool ldStartAutoThreshold(uint16_t trig, uint16_t hold, uint16_t scanS) {

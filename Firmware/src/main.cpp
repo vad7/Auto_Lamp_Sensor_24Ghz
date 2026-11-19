@@ -15,7 +15,9 @@
 // Обрыв основного стабилитрона D1 (напряжение блока выше SUPPLY_FAULT_MV) - индикатор постоянно часто мигает
 // красным, лампа работает как обычно.
 // Работа: человек есть и темно - лампа вкл; человека нет (OT2 = 0 после OFF_DELAY_S) - лампа выкл.
-// Ночник: короткое нажатие BOOT - следующий уровень яркости (по кругу), сохраняется во флеш-памяти;
+// Короткое нажатие BOOT: лампа 230 В не горит - включить, как по датчику (minOnS). Ночник: не горит - дежурная
+// подсветка выкл / уровни по кругу (горит, когда темно - свой порог фоторезистора), горит - следующий уровень яркости
+// (по кругу); сохраняется во флеш-памяти;
 // проценты уровней и порог перегрева - настройка по USB; перегрев по встроенному термодатчику - яркость на 1/3
 // меньше не чаще NIGHT_TEMP_STEP_MS, до уровня 0; остыл на NIGHT_TEMP_HYST_C - обратно теми же шагами.
 #include <Arduino.h>
@@ -27,7 +29,12 @@
 #include "console.h"
 #include "ld2410s.h"
 
-enum class Mode : uint8_t { Normal, SetDelay, CalLeave, CalAbsence, CalPresence, Result };
+enum class Mode : uint8_t {
+    Normal, SetDelay, CalLeave, CalAbsence, CalPresence, Result, Stuck,
+#ifdef NIGHT_LIGHT
+    SetPwm,   // настройка частоты ШИМ кнопкой
+#endif
+};
 
 static Calib    s_cal;                        // действующая калибровка
 static Mode     s_mode = Mode::Normal;        // режим работы
@@ -40,7 +47,7 @@ static uint8_t  s_readTries = 0;              // начало шага 2: ост
 static uint32_t s_readTryMs = 0;              // начало шага 2: время последней попытки (millis)
 static bool     s_sensorReady = false;        // шаг 2: пороги прочитаны, датчик в стандартном отчёте - отчёты считаются
 static uint32_t s_phaseMs = 0;                // начало шага калибровки, показа ошибки, последнее нажатие в настройке
-                                              // задержки (millis)
+                                              // задержки и частоты ШИМ (millis)
 static uint32_t s_lightStepMs = 0;            // последний замер света на шаге калибровки (millis)
 static uint32_t s_lightSum = 0;               // сумма замеров света на шаге калибровки, отсчёты АЦП
 static uint16_t s_lightCount = 0;             // число замеров света на шаге калибровки
@@ -55,11 +62,16 @@ static bool     s_lampOn = false;             // лампа включена
 static bool     s_lightChecked = false;       // работа: свет уже мерили за это присутствие
 static uint32_t s_lightCheckMs = 0;           // работа: время последнего замера света (millis)
 static uint32_t s_presentMs = 0;              // работа: последний опрос с «человек есть» на OT2 (millis)
+static uint32_t s_stuckSinceMs = 0;           // залипание: начало отсчёта - лампа вкл или свет изменился (millis)
+static uint32_t s_stuckLightMs = 0;           // залипание: последний замер света, пока лампа горит (millis)
+static uint16_t s_stuckLightRef = 0;          // залипание: свет в начале отсчёта, отсчёты АЦП
+static bool     s_stuckRestart = false;       // лампа загорелась: начать отсчёт залипания с now ближайшего прохода
+static float    s_stuckBaseDb[SENSOR_GATES];  // режим залипания: фон - максимум энергии ворот за STUCK_BASELINE_MS, дБ
 static bool     s_buttonDown = false;         // кнопка нажата (на прошлом опросе)
 static uint8_t  s_pressStage = 0;             // нажатие: 0 - короткое, 1 - дольше SETUP_PRESS_MS, 2 - калибровка запущена
 static uint32_t s_buttonDownMs = 0;           // начало нажатия (millis)
 static bool     s_setupFlashOn = false;       // горит вспышка «прошло SETUP_PRESS_MS»
-static bool     s_delayFlashOn = false;       // настройка задержки: вспышка счёта сейчас горит
+static bool     s_countFlashOn = false;       // настройка задержки и частоты ШИМ: вспышка счёта сейчас горит
 static bool     s_supplyFault = false;        // D1 оборван (держит запасной D2); до выключения питания
 static bool     s_sensorFault = false;        // датчик не принял настройки за все попытки (нет связи)
 static uint8_t  s_sensorTries = 0;            // осталось попыток записи настроек в датчик
@@ -67,11 +79,21 @@ static uint32_t s_sensorTryMs = 0;            // время последней �
 #ifndef NIGHT_LIGHT
 static uint32_t s_supplyCheckMs = 0;          // время последнего замера напряжения блока (millis)
 #else
-static bool     s_preview = false;            // ночник включён только показать новый уровень яркости
-static uint32_t s_previewMs = 0;              // начало показа уровня (millis)
 static uint8_t  s_limitPct = NIGHT_PWM_RANGE; // перегрев: яркость не больше, %; NIGHT_PWM_RANGE - без ограничения
 static uint32_t s_tempStepMs = 0;             // время последнего шага яркости по температуре (millis)
 static uint32_t s_tempCheckMs = 0;            // время последнего замера температуры (millis)
+static bool     s_standbyLit = false;         // дежурная подсветка горит (темно для неё; основной свет - поверх)
+static uint32_t s_standbyCheckMs = 0;         // последний замер света для дежурки (millis)
+static uint32_t s_standbyQuietMs = 0;         // основной свет или показ уровня ещё были (millis): замер - через
+                                              // STANDBY_SETTLE_MS
+static bool     s_preview = false;            // светло: новый уровень дежурки показывается NIGHT_PREVIEW_MS
+static uint32_t s_previewMs = 0;              // начало показа уровня дежурки (millis)
+static int8_t   s_standbyPhase = -1;          // калибровка, шаг 1: уровень дежурки, с которым идёт замер (индекс);
+                                              // -1 - замер «темно» или замеров нет
+static uint32_t s_standbySum[STANDBY_LEVEL_COUNT];     // суммы замеров света с дежуркой на уровне, отсчёты АЦП
+static uint16_t s_standbyCount[STANDBY_LEVEL_COUNT];   // число замеров света с дежуркой на уровне
+static uint16_t s_standbyDarkLevel[STANDBY_LEVEL_COUNT];   // свет на шаге 1 с дежуркой на уровне, отсчёты АЦП;
+                                                           // 0 - не мерили
 #endif
 
 // Индикатор вне калибровки: погашен или мигает - нет связи с датчиком, обрыв D1.
@@ -106,9 +128,72 @@ static uint8_t lampPercent() {
 #endif
 }
 
+// Яркость при погашенном основном свете, %: ночник - дежурная подсветка (горит или показ уровня), лампа 230 В - 0.
+static uint8_t offPercent() {
+#ifdef NIGHT_LIGHT
+    if (s_cal.standbyLevel == 0 || !(s_standbyLit || s_preview)) {
+        return 0;
+    }
+    const uint8_t pct = s_cal.standbyPct[s_cal.standbyLevel - 1];
+    return pct < s_limitPct ? pct : s_limitPct;
+#else
+    return 0;
+#endif
+}
+
+// Выход лампы по состоянию: основной свет или (ночник) дежурка.
+static void applyLamp() {
+    boardLamp(s_lampOn ? lampPercent() : offPercent());
+}
+
 static void setLamp(bool on) {
+    if (on && !s_lampOn) {   // лампа загорелась - отсчёт залипания заново (в stuckCheckTick, по now прохода loop)
+        s_stuckRestart = true;
+    }
     s_lampOn = on;
-    boardLamp(on ? lampPercent() : 0);
+    applyLamp();
+}
+
+// Свет темнее порога (по направлению кривой фоторезистора).
+static bool darker(uint16_t level, uint16_t threshold) {
+    return s_cal.ldrInputMode == LDR_DARK_LOW ? level < threshold : level > threshold;
+}
+
+static uint16_t clampAdc(int32_t v) {
+    return (uint16_t)(v < 0 ? 0 : v > (int32_t)ADC_FULL ? ADC_FULL : v);
+}
+
+// Пороги дежурки и основного света при ней - от «темно» dark, размаха «светло - темно» span и добавки света горящей
+// дежурки на каждом уровне delta (все - отсчёты АЦП, span и delta - в сторону «светлее»).
+static void standbyThresholds(Calib& c, uint16_t dark, uint16_t span, const uint16_t delta[STANDBY_LEVEL_COUNT]) {
+    const int32_t dir = c.ldrInputMode == LDR_DARK_HIGH ? -1 : 1;   // «светлее» в отсчётах АЦП: +1 или -1
+    const int32_t on = dark + dir * (int32_t)span * STANDBY_ON_PCT / 100;   // дежурка вкл, если темнее
+    c.standbyOnThreshold = clampAdc(on);
+    for (uint8_t i = 0; i < STANDBY_LEVEL_COUNT; i++) {
+        const int32_t hyst = (int32_t)span * STANDBY_HYST_PCT / 100;   // гистерезис, отсчёты АЦП
+        c.standbyOffThreshold[i] = clampAdc(on + dir * ((int32_t)delta[i] + hyst));
+        c.lightThresholdStandby[i] = clampAdc(c.lightThreshold + dir * (int32_t)delta[i]);
+    }
+}
+
+// Пороги дежурки от калибровки света (её нет - середина шкалы как у порога основного света), без добавки
+// собственного света (не мерили).
+static void standbyFromLight(Calib& c) {
+    static const uint16_t NO_DELTA[STANDBY_LEVEL_COUNT] = {};   // свет дежурки не мерили
+    memset(c.lightStandbyLevel, 0, sizeof(c.lightStandbyLevel));
+    const bool measured = c.lightDarkLevel != c.lightLitLevel;   // свет калиброван
+    const uint16_t span = measured ? (c.lightLitLevel > c.lightDarkLevel ? c.lightLitLevel - c.lightDarkLevel
+                                                                         : c.lightDarkLevel - c.lightLitLevel)
+                                   : clampAdc(2 * (int32_t)c.lightThreshold);
+    const uint16_t dark = measured ? c.lightDarkLevel : c.ldrInputMode == LDR_DARK_HIGH ? ADC_FULL : 0;
+    standbyThresholds(c, dark, span, NO_DELTA);
+}
+
+// Дежурка по умолчанию: выключена, уровни STANDBY_LEVELS, пороги - от калибровки света.
+static void standbyDefaults(Calib& c) {
+    c.standbyLevel = 0;
+    memcpy(c.standbyPct, STANDBY_LEVELS, sizeof(c.standbyPct));
+    standbyFromLight(c);
 }
 
 void calibDefaults(Calib& c) {
@@ -122,6 +207,11 @@ void calibDefaults(Calib& c) {
     memcpy(c.nightPct, NIGHT_LEVELS, sizeof(c.nightPct));
     c.tempMax = NIGHT_TEMP_MAX_C;
     c.minOnS = MIN_ON_DEFAULT_S;
+    c.stuckMinutes = STUCK_MINUTES_DEFAULT;   // lightDarkLevel, lightLitLevel = 0: свет не калиброван
+    c.stuckLightPct = STUCK_LIGHT_PCT_DEFAULT;
+    c.stuckDeltaDb = STUCK_DELTA_DB_DEFAULT;
+    c.nightPwmHz = NIGHT_PWM_HZ;
+    standbyDefaults(c);
 }
 
 // Записывает в датчик сохранённую калибровку (пороги, дальние ворота, задержку) и минимальный отчёт.
@@ -224,14 +314,28 @@ static void resetLight(uint32_t now) {
     s_lightCount = 0;
     s_lightWindow = false;
     s_lightStepMs = now - CAL_LIGHT_STEP_MS;   // первый замер - сразу, как начнутся замеры
+#ifdef NIGHT_LIGHT
+    s_standbyPhase = -1;
+    memset(s_standbySum, 0, sizeof(s_standbySum));
+    memset(s_standbyCount, 0, sizeof(s_standbyCount));
+#endif
 }
 
 // Замеры света - только в конце шага длительностью stepMs: индикатор гаснет, чтобы не засвечивать фоторезистор.
+// Ночник, шаг 1: после «темно» - по CAL_STANDBY_WINDOW_MS с дежуркой на каждом уровне (её свет на фоторезисторе).
 static void sampleLight(uint32_t now, uint32_t stepMs) {
-    const uint32_t end = now - s_phaseMs + CAL_LIGHT_WINDOW_MS;   // > stepMs - идёт окно замеров
+    uint32_t window = CAL_LIGHT_WINDOW_MS;   // длина окна замеров в конце шага, мс
+#ifdef NIGHT_LIGHT
+    const bool standbyWindow = s_mode == Mode::CalAbsence && s_cal.ldrInputMode != LDR_NONE;   // шаг 1 - и дежурка
+    if (standbyWindow) {
+        window += STANDBY_LEVEL_COUNT * CAL_STANDBY_WINDOW_MS;
+    }
+#endif
+    const uint32_t end = now - s_phaseMs + window;   // > stepMs - идёт окно замеров
     if (end < stepMs) {
         return;
     }
+    uint32_t settled = end - stepMs;   // мс от начала окна (части окна с дежуркой на уровне)
     if (!s_lightWindow) {
         s_lightWindow = true;
         boardLed(Led::Off);
@@ -241,9 +345,28 @@ static void sampleLight(uint32_t now, uint32_t stepMs) {
         }
 #endif
     }
-    if (end - CAL_LIGHT_SETTLE_MS >= stepMs && now - s_lightStepMs >= CAL_LIGHT_STEP_MS) {
+#ifdef NIGHT_LIGHT
+    if (standbyWindow && settled >= CAL_LIGHT_WINDOW_MS) {
+        uint32_t index = (settled - CAL_LIGHT_WINDOW_MS) / CAL_STANDBY_WINDOW_MS;   // уровень дежурки
+        index = index < STANDBY_LEVEL_COUNT ? index : STANDBY_LEVEL_COUNT - 1;
+        if (s_standbyPhase != (int8_t)index) {
+            s_standbyPhase = (int8_t)index;
+            boardLamp(s_cal.standbyPct[index]);
+        }
+        settled = settled - CAL_LIGHT_WINDOW_MS - index * CAL_STANDBY_WINDOW_MS;
+    }
+#endif
+    if (settled >= CAL_LIGHT_SETTLE_MS && now - s_lightStepMs >= CAL_LIGHT_STEP_MS) {
         s_lightStepMs = now;
-        s_lightSum += boardLight();
+        const uint16_t level = boardLight();   // отсчёт фоторезистора
+#ifdef NIGHT_LIGHT
+        if (s_standbyPhase >= 0) {
+            s_standbySum[s_standbyPhase] += level;
+            s_standbyCount[s_standbyPhase]++;
+            return;
+        }
+#endif
+        s_lightSum += level;
         s_lightCount++;
     }
 }
@@ -258,7 +381,17 @@ void calibPlan(Stream& s) {
     s.printf("  2. %lu с снаружи, двери закрыты, в зоне датчика никого - автокалибровка датчика по фону; "
              "LED красный\n", (unsigned long)(CAL_SCAN_S + CAL_SCAN_MARGIN_S));
     if (ldr) {
+#ifdef NIGHT_LIGHT
+        s.printf("     последние %lu с LED не горит: %lu с замер «темно», затем по %lu с ночник светит уровнями "
+                 "дежурной подсветки", win + STANDBY_LEVEL_COUNT * CAL_STANDBY_WINDOW_MS / 1000, win,
+                 (unsigned long)(CAL_STANDBY_WINDOW_MS / 1000));
+        for (uint8_t i = 0; i < STANDBY_LEVEL_COUNT; i++) {
+            s.printf(" %u", s_cal.standbyPct[i]);
+        }
+        s.printf(" %% - замер её света\n");
+#else
         s.printf("     последние %lu с LED не горит - замер «темно»\n", win);
+#endif
     }
     s.printf("     затем пауза %lu с и чтение порогов из датчика (до %u попыток раз в %lu с) - оставаться снаружи; "
              "LED красный\n", (unsigned long)(CAL_READ_PAUSE_MS / 1000), CAL_READ_TRIES,
@@ -277,7 +410,9 @@ void calibPlan(Stream& s) {
 
 // Начало калибровки: лампа выкл, индикатор красный / зелёный по очереди - CAL_LEAVE_S на выход из комнаты.
 // showPlan - вывести стадии в монитор порта (запуск кнопкой; из консоли они уже показаны).
-static void startCalibration(bool showPlan) {
+// now - время прохода loop, не millis(): после вывода стадий оно больше now, и CalLeave того же прохода
+// (now - s_phaseMs через 0) сразу считал бы паузу прошедшей - шаг 1 без паузы на выход.
+static void startCalibration(bool showPlan, uint32_t now) {
     LOG("Калибровка: %lu с выйти из комнаты\n", (unsigned long)CAL_LEAVE_S);
 #if !LOW_POWER || defined(DEBUG_LOG)
     if (showPlan && boardConsoleConnected()) {
@@ -287,10 +422,17 @@ static void startCalibration(bool showPlan) {
     (void)showPlan;
 #endif
     calMsg("1. ожидание %lu с - выйти из комнаты; LED красный / зелёный", (unsigned long)CAL_LEAVE_S);
+    if (s_mode == Mode::Stuck) {
+        boardSensorEnd();   // режим залипания кончился; калибровка откроет UART сама (датчик - в режим команд)
+    }
+#ifdef NIGHT_LIGHT
+    s_standbyLit = false;   // дежурка в калибровке не горит (кроме замера с ней в шаге 1)
+    s_preview = false;
+#endif
     setLamp(false);
     boardLed(Led::CalLeave);
     s_mode = Mode::CalLeave;
-    s_phaseMs = millis();
+    s_phaseMs = now;
 }
 
 // Шаг 1: индикатор красный, автокалибровка порогов датчика по фону.
@@ -303,7 +445,12 @@ static void startAbsence(uint32_t now) {
     LOG("Автокалибровка датчика запущена: %s\n", ok ? "да" : "нет ответа");   // ACK 0x0009 в протоколе неясен
     calMsg("2. снаружи, двери закрыты, %lu с (автокалибровка датчика по фону: %s); LED красный, последние %lu с "
            "не горит", (unsigned long)(CAL_SCAN_S + CAL_SCAN_MARGIN_S), ok ? "запущена" : "нет ответа",
+#ifdef NIGHT_LIGHT
+           (unsigned long)((CAL_LIGHT_WINDOW_MS +
+                            (s_cal.ldrInputMode != LDR_NONE ? STANDBY_LEVEL_COUNT * CAL_STANDBY_WINDOW_MS : 0)) / 1000));
+#else
            (unsigned long)(CAL_LIGHT_WINDOW_MS / 1000));
+#endif
     (void)ok;
     resetLight(now);
     s_progressStep = UINT8_MAX;
@@ -322,6 +469,16 @@ static void startPresence(uint32_t now) {
         return;
     }
     s_darkLevel = (uint16_t)(s_lightSum / s_lightCount);
+#ifdef NIGHT_LIGHT
+    setLamp(false);   // конец замера с дежуркой
+    for (uint8_t i = 0; i < STANDBY_LEVEL_COUNT; i++) {
+        s_standbyDarkLevel[i] = s_standbyCount[i] ? (uint16_t)(s_standbySum[i] / s_standbyCount[i]) : 0;
+        if (s_standbyCount[i]) {
+            calMsg("свет: темно %u, с дежурной подсветкой %u %% - %u", s_darkLevel, s_cal.standbyPct[i],
+                   s_standbyDarkLevel[i]);
+        }
+    }
+#endif
     calMsg("пауза %lu с, затем чтение порогов из датчика (до %u попыток раз в %lu с); LED красный - оставаться снаружи",
            (unsigned long)(CAL_READ_PAUSE_MS / 1000), CAL_READ_TRIES, (unsigned long)(CAL_READ_RETRY_MS / 1000));
     boardLed(Led::Red);
@@ -441,6 +598,36 @@ static void finishCalibration() {
     memcpy(c.nightPct, s_cal.nightPct, sizeof(c.nightPct));
     c.tempMax = s_cal.tempMax;
     c.minOnS = s_cal.minOnS;
+    c.lightDarkLevel = noLdr ? 0 : s_darkLevel;   // для проверки залипания: свет «не меняется»
+    c.lightLitLevel = noLdr ? 0 : lit;
+    c.stuckMinutes = s_cal.stuckMinutes;
+    c.stuckLightPct = s_cal.stuckLightPct;
+    c.stuckDeltaDb = s_cal.stuckDeltaDb;
+    c.nightPwmHz = s_cal.nightPwmHz;
+    standbyDefaults(c);
+#ifdef NIGHT_LIGHT
+    c.standbyLevel = s_cal.standbyLevel;   // выбор кнопкой и проценты уровней калибровка не сбрасывает
+    memcpy(c.standbyPct, s_cal.standbyPct, sizeof(c.standbyPct));
+    if (!noLdr && s_standbyDarkLevel[0]) {   // замеры с дежуркой были (все уровни подряд)
+        const bool rising = c.ldrInputMode == LDR_DARK_LOW;   // больше света - больше отсчёт
+        uint16_t delta[STANDBY_LEVEL_COUNT];                  // свет дежурки на фоторезисторе по уровням
+        for (uint8_t i = 0; i < STANDBY_LEVEL_COUNT; i++) {
+            c.lightStandbyLevel[i] = s_standbyDarkLevel[i];
+            const int32_t add = (rising ? 1 : -1) * ((int32_t)s_standbyDarkLevel[i] - s_darkLevel);
+            delta[i] = (uint16_t)(add > 0 ? add : 0);
+        }
+        standbyThresholds(c, s_darkLevel, diff, delta);
+        calMsg("дежурка: вкл темнее %u", c.standbyOnThreshold);
+        for (uint8_t i = 0; i < STANDBY_LEVEL_COUNT; i++) {
+            calMsg("дежурка %u %%: свет с ней %u, погасить светлее %u; основной свет при ней - темнее %u",
+                   c.standbyPct[i], c.lightStandbyLevel[i], c.standbyOffThreshold[i], c.lightThresholdStandby[i]);
+            if (rising ? c.standbyOffThreshold[i] >= lit : c.standbyOffThreshold[i] <= lit) {
+                calMsg("ВНИМАНИЕ: свет дежурки %u %% на фоторезисторе больше разницы «светло - темно» - при включённом "
+                       "свете в ванной она может не гаснуть (поправить sboff)", c.standbyPct[i]);
+            }
+        }
+    }
+#endif
     const bool ok = ldEnableConfig() && ldReadThresholds(LD_CMD_READ_HOLD, c.hold) &&
                     ldWriteParams(farGate, c.offDelay) && ldSetStandardMode(false);
     ldEndConfig();
@@ -459,16 +646,27 @@ static void finishCalibration() {
     startResult(true);
 }
 
-static void normalTick(uint32_t now) {
-#ifdef NIGHT_LIGHT
-    if (s_preview) {
-        if (now - s_previewMs < NIGHT_PREVIEW_MS) {
-            return;
-        }
-        s_preview = false;
-        setLamp(false);   // дальше - как обычно: по присутствию и свету
+// Темно ли (по фоторезистору и порогу калибровки; ночник при горящей дежурке - её порог: фоторезистор видит её свет);
+// без фоторезистора - всегда темно.
+static bool isDark() {
+    if (s_cal.ldrInputMode == LDR_NONE) {
+        return true;
     }
+#ifdef NIGHT_LIGHT
+    const uint16_t threshold = s_standbyLit && s_cal.standbyLevel   // порог «темно»
+                                   ? s_cal.lightThresholdStandby[s_cal.standbyLevel - 1] : s_cal.lightThreshold;
+#else
+    const uint16_t threshold = s_cal.lightThreshold;
 #endif
+    const uint16_t level = boardLight();
+    const bool dark = darker(level, threshold);
+    LOG("человек, свет %u (порог %u): %s\n", level, threshold, dark ? "темно - лампа вкл" : "светло");
+    return dark;
+}
+
+static void startStuck(uint32_t now);
+
+static void normalTick(uint32_t now) {
     const bool present = boardPresence();
     if (present) {
         s_presentMs = now;   // каждый импульс OT2 продлевает свет на minOnS
@@ -489,12 +687,97 @@ static void normalTick(uint32_t now) {
     }
     s_lightChecked = true;
     s_lightCheckMs = now;
-    const uint16_t level = boardLight();
-    const bool dark = s_cal.ldrInputMode == LDR_NONE ||
-                      (s_cal.ldrInputMode == LDR_DARK_LOW ? level < s_cal.lightThreshold : level > s_cal.lightThreshold);
-    LOG("человек, свет %u (порог %u): %s\n", level, s_cal.lightThreshold, dark ? "темно - лампа вкл" : "светло");
-    if (dark) {
+    if (isDark()) {
         setLamp(true);
+    }
+}
+
+// Залипание: лампа горит s_cal.stuckMinutes без перерыва, свет (если есть калибровка света) не выходит из
+// полосы ± stuckLightPct % от «светло - темно» - предмет у датчика держит «человек есть». Свет изменился - отсчёт заново.
+static void stuckCheckTick(uint32_t now) {
+    if (!s_lampOn || s_cal.stuckMinutes == 0) {
+        return;
+    }
+    if (s_stuckRestart) {   // не millis() в setLamp: оно позже now, now - s_stuckSinceMs ушло бы через 0
+        s_stuckRestart = false;
+        s_stuckSinceMs = s_stuckLightMs = now;
+        s_stuckLightRef = boardLight();
+    }
+    const uint16_t span = s_cal.lightLitLevel > s_cal.lightDarkLevel ? s_cal.lightLitLevel - s_cal.lightDarkLevel
+                                                                     : s_cal.lightDarkLevel - s_cal.lightLitLevel;
+    const uint16_t band = (uint16_t)((uint32_t)span * s_cal.stuckLightPct / 100);   // полоса «не меняется», отсчёты
+    if (s_cal.ldrInputMode != LDR_NONE && band > 0 && now - s_stuckLightMs >= STUCK_LIGHT_CHECK_MS) {
+        s_stuckLightMs = now;
+        const uint16_t level = boardLight();
+        if (level > s_stuckLightRef + band || level + band < s_stuckLightRef) {
+            s_stuckSinceMs = now;
+            s_stuckLightRef = level;
+        }
+    }
+    if (now - s_stuckSinceMs >= (uint32_t)s_cal.stuckMinutes * 60000UL) {
+        startStuck(now);
+    }
+}
+
+// Режим залипания: лампа выкл, индикатор - белые вспышки, датчик - в стандартный отчёт (энергия по воротам).
+static void startStuck(uint32_t now) {
+    LOG("Залипание: лампа %u мин без перерыва - режим по энергии ворот\n", s_cal.stuckMinutes);
+    setLamp(false);
+    boardLed(Led::StuckFlash);
+    ldBegin(boardSensorBegin());
+    const bool ok = ldEnableConfig() && ldSetStandardMode(true);
+    ldEndConfig();
+    LOG("стандартный отчёт: %s\n", ok ? "да" : "нет ответа");   // нет - лампа не включится, выход по OT2 = 0
+    (void)ok;
+    for (uint8_t g = 0; g < SENSOR_GATES; g++) {
+        s_stuckBaseDb[g] = 0;
+    }
+    s_lightChecked = false;
+    s_phaseMs = now;
+    s_mode = Mode::Stuck;
+}
+
+// Выход из залипания: датчик в минимальный отчёт, UART выкл, обычная работа (лампа - по OT2 и minOnS).
+static void finishStuck() {
+    LOG("Залипание кончилось: OT2 = 0\n");
+    ldEnableConfig();
+    ldSetStandardMode(false);
+    ldEndConfig();
+    boardSensorEnd();
+    s_mode = Mode::Normal;
+    ledIdle();
+}
+
+// Режим залипания: фон - первые STUCK_BASELINE_MS; потом любые ворота выше фона на stuckDeltaDb - «человек»:
+// лампа вкл (если темно), гаснет через minOnS после последнего превышения.
+static void stuckTick(uint32_t now) {
+    if (!boardPresence()) {
+        finishStuck();
+        return;
+    }
+    const bool baseline = now - s_phaseMs < STUCK_BASELINE_MS;   // идёт замер фона
+    bool above = false;   // в принятых отчётах есть ворота выше фона
+    LdReport r;
+    while (ldPoll(r)) {
+        if (r.type != 1) {
+            continue;
+        }
+        for (uint8_t g = 0; g < SENSOR_GATES; g++) {
+            const float db = r.energy[g] > 0 ? ENERGY_DB_SCALE * log10f((float)r.energy[g]) : 0.0f;   // дБ, как пороги
+            if (baseline) {
+                s_stuckBaseDb[g] = db > s_stuckBaseDb[g] ? db : s_stuckBaseDb[g];
+            } else if (db >= s_stuckBaseDb[g] + s_cal.stuckDeltaDb) {
+                above = true;
+            }
+        }
+    }
+    if (above) {
+        s_presentMs = now;
+        if (!s_lampOn && isDark()) {
+            setLamp(true);
+        }
+    } else if (s_lampOn && now - s_presentMs >= (uint32_t)s_cal.minOnS * 1000) {
+        setLamp(false);
     }
 }
 
@@ -531,35 +814,88 @@ static void tempTick(uint32_t now) {
     s_limitPct = (uint8_t)limit;
     s_tempStepMs = now;
     LOG("перегрев: предел яркости %u %%\n", s_limitPct);
-    if (s_lampOn) {
-        setLamp(true);   // применить новую яркость
+    applyLamp();   // новая яркость - основному свету или дежурке
+}
+
+// Дежурка должна гореть: уровень выбран и темно - пока не горит, темнее порога вкл; горит (фоторезистор видит её
+// свет) - пока не светлее порога «погасить». Без фоторезистора - всегда темно.
+static bool standbyShouldLight() {
+    if (s_cal.standbyLevel == 0) {
+        return false;
+    }
+    if (s_cal.ldrInputMode == LDR_NONE) {
+        return true;
+    }
+    return darker(boardLight(),
+                  s_standbyLit ? s_cal.standbyOffThreshold[s_cal.standbyLevel - 1] : s_cal.standbyOnThreshold);
+}
+
+// Дежурка: конец показа уровня; замер света раз в STANDBY_CHECK_MS, пока основной свет не горит (после него и после
+// показа уровня - не раньше STANDBY_SETTLE_MS: фоторезистор ещё видит их свет).
+static void standbyTick(uint32_t now) {
+    if (s_preview && now - s_previewMs >= NIGHT_PREVIEW_MS) {
+        s_preview = false;
+        applyLamp();
+    }
+    if (s_lampOn || s_preview) {
+        s_standbyQuietMs = now;
+        return;
+    }
+    if (now - s_standbyQuietMs < STANDBY_SETTLE_MS || now - s_standbyCheckMs < STANDBY_CHECK_MS) {
+        return;
+    }
+    s_standbyCheckMs = now;
+    const bool lit = standbyShouldLight();
+    if (lit != s_standbyLit) {
+        s_standbyLit = lit;
+        LOG("дежурка: %s\n", lit ? "темно - горит" : "светло - погашена");
+        applyLamp();
     }
 }
 
-// Короткое нажатие: следующий уровень яркости по кругу, сохранить. Ночник не горел - показать уровень.
-static void nextLevel(uint32_t now) {
-    s_cal.nightLevel = (uint8_t)((s_cal.nightLevel + 1) % NIGHT_LEVEL_COUNT);
+// Короткое нажатие при погашенном основном свете: дежурка выкл / уровень 1 / 2 / 3 по кругу, сохранить; темно - горит
+// сразу на новом уровне, светло - уровень показывается NIGHT_PREVIEW_MS.
+static void nextStandby(uint32_t now) {
+    s_cal.standbyLevel = (uint8_t)((s_cal.standbyLevel + 1) % (STANDBY_LEVEL_COUNT + 1));
     boardSave(s_cal);
-    LOG("ночник: яркость %u %%\n", lampPercent());
-    if (!s_lampOn) {
-        s_preview = true;
-        s_previewMs = now;
-    }
-    setLamp(true);
+    s_standbyLit = standbyShouldLight();
+    s_preview = s_cal.standbyLevel != 0 && !s_standbyLit;
+    s_previewMs = now;
+    s_standbyCheckMs = now;
+    LOG("дежурка: уровень %u (%u %%)\n", s_cal.standbyLevel,
+        s_cal.standbyLevel ? s_cal.standbyPct[s_cal.standbyLevel - 1] : 0);
+    applyLamp();
 }
 #endif
 
-// Настройка задержки: показ счёта заново - с последнего нажатия.
-static void startDelayShow(uint32_t now) {
+// Короткое нажатие (пользователь). Лампа 230 В: включить, как по датчику (свет не проверяется - включили рукой),
+// гаснет через minOnS без присутствия. Ночник: основной свет не горит - дежурная подсветка по кругу, горит - следующий
+// уровень яркости по кругу, сохранить.
+static void shortPress(uint32_t now) {
+    s_presentMs = now;   // как импульс OT2: горит не меньше minOnS от нажатия
+#ifdef NIGHT_LIGHT
+    if (!s_lampOn) {
+        nextStandby(now);
+        return;
+    }
+    s_cal.nightLevel = (uint8_t)((s_cal.nightLevel + 1) % NIGHT_LEVEL_COUNT);
+    boardSave(s_cal);
+#endif
+    LOG("кнопка: лампа %u %%\n", lampPercent());
+    setLamp(true);
+}
+
+// Настройка задержки и частоты ШИМ: показ счёта заново - с последнего нажатия.
+static void startCountShow(uint32_t now) {
     s_phaseMs = now;
-    s_delayFlashOn = false;
+    s_countFlashOn = false;
     boardLed(Led::Off);
 }
 
 static void startSetDelay(uint32_t now) {
     LOG("Настройка задержки: %u с\n", s_cal.offDelay);
     s_mode = Mode::SetDelay;
-    startDelayShow(now);
+    startCountShow(now);
 }
 
 // Шаг задержки: +1 / -1 шаг OFF_DELAY_STEP_S в пределах OFF_DELAY_MIN_S..OFF_DELAY_MAX_S.
@@ -569,18 +905,17 @@ static void stepDelay(int8_t dir, uint32_t now) {
         s_cal.offDelay = (uint8_t)v;
     }
     LOG("задержка: %u с\n", s_cal.offDelay);
-    startDelayShow(now);
+    startCountShow(now);
 }
 
-// Счёт: offDelay / OFF_DELAY_STEP_S синих вспышек, пауза FLASH_PAUSE_MS, по кругу.
-static void delayShowTick(uint32_t now) {
+// Счёт: count вспышек цвета color, пауза FLASH_PAUSE_MS, по кругу (задержка - синим, частота ШИМ - зелёным).
+static void countShowTick(uint32_t now, uint32_t count, Led color) {
     const uint32_t period = FLASH_ON_MS + FLASH_OFF_MS;
-    const uint32_t count = s_cal.offDelay / OFF_DELAY_STEP_S;
     const uint32_t t = (now - s_phaseMs) % (count * period + FLASH_PAUSE_MS);
     const bool on = t < count * period && t % period < FLASH_ON_MS;
-    if (on != s_delayFlashOn) {
-        s_delayFlashOn = on;
-        boardLed(on ? Led::Blue : Led::Off);
+    if (on != s_countFlashOn) {
+        s_countFlashOn = on;
+        boardLed(on ? color : Led::Off);
     }
 }
 
@@ -593,8 +928,59 @@ static void finishSetDelay() {
     startSensorWrite();
 }
 
-// Кнопка: удержание CAL_PRESS_MS - калибровка; SETUP_PRESS_MS и отпустили - настройка задержки; короткое -
-// ночник: яркость. В настройке задержки: короче DELAY_DEC_PRESS_MS - плюс шаг, дольше - минус.
+#ifdef NIGHT_LIGHT
+// Частота ШИМ khz кГц: в настройку и в ШИМ, ночник горит на выбранном уровне.
+static void applyPwmKhz(uint32_t khz) {
+    s_cal.nightPwmHz = khz * HZ_PER_KHZ;
+    LOG("частота ШИМ: %lu Гц\n", (unsigned long)s_cal.nightPwmHz);
+    boardLampFreq(s_cal.nightPwmHz);   // гасит ночник - зажечь снова
+    setLamp(true);
+}
+
+// Из настройки задержки (удержание): задержку сохранить, частота - целые кГц в пределах настройки, зелёный - пока держат.
+static void startSetPwm(uint32_t now) {
+    finishSetDelay();   // запись задержки в датчик - после выхода в обычную работу
+    uint32_t khz = s_cal.nightPwmHz / HZ_PER_KHZ;   // целые кГц (3500 Гц -> 3)
+    khz = khz < PWM_SETUP_KHZ_MIN ? PWM_SETUP_KHZ_MIN : khz > PWM_SETUP_KHZ_MAX ? PWM_SETUP_KHZ_MAX : khz;
+    s_mode = Mode::SetPwm;
+    s_phaseMs = now;
+    boardLed(Led::Green);
+    applyPwmKhz(khz);
+}
+
+// Шаг частоты: +1 / -1 кГц по кругу PWM_SETUP_KHZ_MIN..PWM_SETUP_KHZ_MAX.
+static void stepPwm(int8_t dir, uint32_t now) {
+    uint32_t khz = s_cal.nightPwmHz / HZ_PER_KHZ + dir;
+    khz = khz > PWM_SETUP_KHZ_MAX ? PWM_SETUP_KHZ_MIN : khz < PWM_SETUP_KHZ_MIN ? PWM_SETUP_KHZ_MAX : khz;
+    applyPwmKhz(khz);
+    startCountShow(now);
+}
+
+// Выход из настройки частоты: сохранить, ночник погасить - дальше по присутствию и свету.
+static void finishSetPwm() {
+    boardSave(s_cal);
+    LOG("Частота ШИМ сохранена: %lu Гц\n", (unsigned long)s_cal.nightPwmHz);
+    s_mode = Mode::Normal;
+    ledIdle();
+    setLamp(false);
+    s_lightChecked = false;
+}
+#endif
+
+// Удержание CAL_PRESS_MS: в настройке задержки ночника - настройка частоты ШИМ, иначе - калибровка.
+static void longHold(uint32_t now) {
+#ifdef NIGHT_LIGHT
+    if (s_mode == Mode::SetDelay) {
+        startSetPwm(now);
+        return;
+    }
+#endif
+    startCalibration(true, now);
+}
+
+// Кнопка: удержание CAL_PRESS_MS - калибровка (в настройке задержки ночника - настройка частоты ШИМ); SETUP_PRESS_MS
+// и отпустили - настройка задержки; короткое - включить (ночник горит - яркость). В настройке задержки и частоты: короче
+// DELAY_DEC_PRESS_MS - плюс шаг, дольше - минус.
 static void buttonTick(uint32_t now) {
     if (s_setupFlashOn && now - s_buttonDownMs >= SETUP_PRESS_MS + FLASH_ON_MS) {
         s_setupFlashOn = false;
@@ -611,7 +997,7 @@ static void buttonTick(uint32_t now) {
         const uint32_t held = now - s_buttonDownMs;
         if (s_pressStage < 2 && held >= CAL_PRESS_MS) {
             s_pressStage = 2;
-            startCalibration(true);
+            longHold(now);
         } else if (s_pressStage == 0 && held >= SETUP_PRESS_MS && s_mode == Mode::Normal) {
             s_pressStage = 1;
             s_setupFlashOn = true;
@@ -623,22 +1009,54 @@ static void buttonTick(uint32_t now) {
         return;
     }
     s_buttonDown = false;
+    const int8_t dir = now - s_buttonDownMs < DELAY_DEC_PRESS_MS ? 1 : -1;   // настройка: короткое +, длинное -
     if (s_pressStage == 2) {
+#ifdef NIGHT_LIGHT
+        if (s_mode == Mode::SetPwm) {
+            startCountShow(now);   // отпустили после входа: зелёный гаснет, счёт кГц
+        }
+#endif
         return;
     }
     if (s_mode == Mode::SetDelay) {
-        stepDelay(now - s_buttonDownMs < DELAY_DEC_PRESS_MS ? 1 : -1, now);
+        stepDelay(dir, now);
+#ifdef NIGHT_LIGHT
+    } else if (s_mode == Mode::SetPwm) {
+        stepPwm(dir, now);
+#endif
     } else if (s_mode == Mode::Normal && s_pressStage == 1) {
         startSetDelay(now);
-#ifdef NIGHT_LIGHT
     } else if (s_mode == Mode::Normal) {
-        nextLevel(now);
-#endif
+        shortPress(now);
     }
 }
 
+// Калибровка из флеш; версии 6-8 переводятся в текущую без потери калибровки: недостающие поля (за старой
+// структурой во флеш - мусор) - по умолчанию; у версии 8 уровень и проценты дежурки те же, пороги - заново от света.
+static bool loadCalib() {
+    if (boardLoad(s_cal)) {
+        return true;
+    }
+    const uint16_t v = s_cal.version;   // версия во флеш
+    if (s_cal.magic != CALIB_MAGIC ||
+        (v != CALIB_VERSION_NO_PWM && v != CALIB_VERSION_NO_STANDBY && v != CALIB_VERSION_ONE_STANDBY)) {
+        return false;
+    }
+    if (v == CALIB_VERSION_NO_PWM) {
+        s_cal.nightPwmHz = NIGHT_PWM_HZ;
+    }
+    if (v == CALIB_VERSION_ONE_STANDBY) {
+        standbyFromLight(s_cal);
+    } else {
+        standbyDefaults(s_cal);
+    }
+    s_cal.version = CALIB_VERSION;
+    boardSave(s_cal);
+    return true;
+}
+
 void setup() {
-    if (!boardLoad(s_cal)) {   // первое включение - без калибровки, по умолчанию; калибровка - долгим нажатием
+    if (!loadCalib()) {   // первое включение - без калибровки, по умолчанию; калибровка - долгим нажатием
         calibDefaults(s_cal);
     }
     bool calib = false;   // консоль: команда calib
@@ -646,7 +1064,10 @@ void setup() {
         calib = consoleRun(*con, s_cal);
     }
     boardInit();
-    boardLed(Led::Green);   // вспышка при включении: прошивка запустилась (повторяется - МК перезапускается)
+#ifdef NIGHT_LIGHT
+    boardLampFreq(s_cal.nightPwmHz);   // после boardInit: делитель - от рабочих тактов
+#endif
+    boardLed(Led::Green);  // вспышка при включении: прошивка запустилась (повторяется - МК перезапускается)
     delay(BOOT_FLASH_MS);
     boardLed(Led::Off);
 #ifndef NIGHT_LIGHT
@@ -656,7 +1077,7 @@ void setup() {
         sensorCalibrated(s_cal) ? "есть" : "нет (по умолчанию)", s_cal.offDelay);
     startSensorWrite();
     if (calib) {
-        startCalibration(false);   // стадии консоль уже показала
+        startCalibration(false, millis());   // стадии консоль уже показала
     }
 }
 
@@ -673,22 +1094,44 @@ void loop() {
     case Mode::Normal:
         sensorWriteTick(now);
         normalTick(now);
+        stuckCheckTick(now);
 #ifdef NIGHT_LIGHT
         tempTick(now);
+        standbyTick(now);
 #endif
-        boardSleep(TICK_MS, true);
+        boardSleep(TICK_MS, s_mode == Mode::Normal);   // начался режим залипания - UART должен принимать
         return;
+    case Mode::Stuck:   // лампа - по энергии ворот, выход - OT2 = 0 или калибровка
+        stuckTick(now);
+#ifdef NIGHT_LIGHT
+        tempTick(now);
+        standbyTick(now);
+#endif
+        break;
     case Mode::SetDelay:   // лампа работает как обычно
         normalTick(now);
 #ifdef NIGHT_LIGHT
         tempTick(now);
+        standbyTick(now);
 #endif
-        delayShowTick(now);
+        countShowTick(now, s_cal.offDelay / OFF_DELAY_STEP_S, Led::Blue);
         if (!s_buttonDown && now - s_phaseMs >= DELAY_EXIT_MS) {
             finishSetDelay();
         }
         boardSleep(TICK_MS, true);
         return;
+#ifdef NIGHT_LIGHT
+    case Mode::SetPwm:   // ночник горит на выбранном уровне - слушать писк; присутствие не смотрим
+        tempTick(now);
+        if (!s_buttonDown) {   // держат после входа - горит зелёный
+            countShowTick(now, s_cal.nightPwmHz / HZ_PER_KHZ, Led::Green);
+            if (now - s_phaseMs >= PWM_SETUP_EXIT_MS) {
+                finishSetPwm();
+            }
+        }
+        boardSleep(TICK_MS, true);   // идёт ШИМ - boardSleep сам спит без остановки тактов
+        return;
+#endif
     case Mode::CalLeave:
         if (now - s_phaseMs >= CAL_LEAVE_S * 1000) {
             startAbsence(now);

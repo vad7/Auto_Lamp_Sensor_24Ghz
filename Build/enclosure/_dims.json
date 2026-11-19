@@ -6,7 +6,7 @@
  ],
  "corner_r": 10.0,
  "inner_depth": 23.0,
- "radome_t": 3.71,
- "radome_gap": 6.21,
+ "radome_wall": 0.7,
+ "antenna_gap": 9.23,
  "screws": "2.5x8 x6 (крышка 4, пластины 2), потай"
 }

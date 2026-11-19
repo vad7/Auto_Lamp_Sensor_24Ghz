@@ -1,6 +1,7 @@
 // Консоль настройки по USB: открывается только при включении с перемычкой (boardConsoleOpen), до обычной работы - поэтому
 // ожидание ввода через delay() (этап setup). Выход - exit или CONSOLE_IDLE_MS без команд.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "config.h"
 #include "console.h"
@@ -23,29 +24,56 @@ static void help(Stream& s) {
              "  show        - показать настройки\n"
              "  delay N     - задержка выключения, с: %u..%u, шаг %u\n"
              "  minon N     - свет горит не меньше N с от последнего импульса OT2 (против дребезга): 0..65535\n"
+             "  stuck N     - залипание: лампа горит N мин без перерыва и свет не меняется - выкл, свет по энергии\n"
+             "                ворот датчика; 0..65535, 0 - не проверять\n"
+             "  stuckpct P  - залипание: свет «не меняется» в пределах P %% от «светло - темно» калибровки; 0..100,\n"
+             "                0 - только время\n"
+             "  stuckdb N   - залипание: лампа вкл, если энергия ворот выше фона на N дБ; 1..%u\n"
              "  light N     - АЦП: порог света, отсчёты 0..%lu\n"
              "  ldr 0|1|2   - фоторезистор: 0 - нет (свет не проверяется, всегда «темно»); 1 - больше света -\n"
              "                больший отсчёт АЦП (темно - малый); 2 - больше света - меньший отсчёт (темно - большой)\n"
              "  far N       - дальние ворота 1..%u (дальность, ворота около 0,7 м); 0 - не писать в датчик\n"
-             "  trig G N    - порог срабатывания ворот G (0..%u)\n"
-             "  hold G N    - порог удержания ворот G\n",
-             OFF_DELAY_MIN_S, OFF_DELAY_MAX_S, OFF_DELAY_STEP_S, (unsigned long)ADC_FULL, SENSOR_FAR_MAX,
-             SENSOR_GATES - 1);
+             "  0: 53 / 47  - пороги ворот 0..%u: срабатывания / удержания, как в show; в строке - одни ворота или\n"
+             "                несколько подряд: 0: 53 / 47 1: 52 / 46 ...; вставить все строки из show или sensor\n",
+             OFF_DELAY_MIN_S, OFF_DELAY_MAX_S, OFF_DELAY_STEP_S, STUCK_DELTA_DB_MAX, (unsigned long)ADC_FULL,
+             SENSOR_FAR_MAX, SENSOR_GATES - 1);
 #ifdef NIGHT_LIGHT
     s.printf("  level N     - выбранный уровень яркости ночника 0..%u\n"
-             "  pct L P     - яркость уровня L, %%: 1..%lu (уровень 0 - минимум при перегреве)\n"
+             "  pct P0 P1.. - яркость всех уровней через пробел, %%: 1..%lu (уровень 0 - минимум при перегреве)\n"
              "  tmax N      - порог перегрева, °C: %d..%d (выше - яркость на 1/3 меньше раз в %lu с)\n"
-             "  on P        - включить ночник с яркостью P, %%: 0..%lu (0 - выкл; проверка, не сохраняется)\n",
+             "  pwm N       - частота ШИМ ночника, Гц: %lu..%lu (по умолчанию %lu)\n"
+             "  sb N        - дежурная подсветка: 0 - выкл, 1..%u - уровень (кнопка при погашенном свете - по кругу)\n"
+             "  sbpct P1 .. - яркость уровней дежурки через пробел, %%: 1..%lu\n"
+             "  sbon N      - дежурка вкл, если свет темнее N (отсчёт АЦП, как «свет сейчас»)\n"
+             "  sboff N1 .. - по уровням дежурки: горящая гаснет, если светлее (её свет тоже на фоторезисторе)\n"
+             "  lightsb N1 .. - по уровням дежурки: порог основного света, пока она горит (вместо light)\n"
+             "  on P [F]    - включить ночник с яркостью P, %%: 0..%lu (0 - выкл), частота ШИМ F, Гц (без F - pwm);\n"
+             "                проверка, не сохраняется\n",
              NIGHT_LEVEL_COUNT - 1, (unsigned long)NIGHT_PWM_RANGE, NIGHT_TMAX_MIN_C, NIGHT_TMAX_MAX_C,
-             (unsigned long)(NIGHT_TEMP_STEP_MS / 1000), (unsigned long)NIGHT_PWM_RANGE);
+             (unsigned long)(NIGHT_TEMP_STEP_MS / 1000), (unsigned long)NIGHT_PWM_HZ_MIN,
+             (unsigned long)NIGHT_PWM_HZ_MAX, (unsigned long)NIGHT_PWM_HZ, STANDBY_LEVEL_COUNT,
+             (unsigned long)NIGHT_PWM_RANGE, (unsigned long)NIGHT_PWM_RANGE);
 #endif
     s.printf("  sensor      - диагностика датчика: отчёты по UART, ответ на команды, пороги в датчике\n"
+             "  sens W V    - опыт: параметр датчика W = V сразу в датчик, не сохраняется (табл. 2-2, W десятичное):\n"
+             "                2 - отчёт состояния, Гц x10 (5..80); 12 - отчёт расстояния, Гц x10; 11 - отклик 5 / 10;\n"
+             "                10 - ближние ворота; 5, 6, 11 прошивка перезаписывает при каждом включении\n"
              "  mon         - монитор: OT2, отчёт датчика, свет, кнопка BOOT; выход - любая клавиша\n"
              "  calib       - выйти и запустить калибровку (как удержание BOOT %lu с)\n"
              "  reset       - настройки по умолчанию (калибровка стирается)\n"
              "  exit        - выйти и начать работу (сам - через %lu с без команд)\n",
              (unsigned long)(CAL_PRESS_MS / 1000), (unsigned long)(CONSOLE_IDLE_MS / 1000));
 }
+
+#ifdef NIGHT_LIGHT
+// Значения уровней через пробел (show).
+template <typename T>
+static void printValues(Stream& s, const T* v, uint8_t count) {
+    for (uint8_t l = 0; l < count; l++) {
+        s.printf(" %u", (unsigned)v[l]);
+    }
+}
+#endif
 
 static void show(Stream& s, const Calib& c) {
     s.printf("Версия %s, калибровка датчика: %s\n", FW_VERSION,
@@ -56,17 +84,38 @@ static void show(Stream& s, const Calib& c) {
     for (uint8_t l = 0; l < NIGHT_LEVEL_COUNT; l++) {
         s.printf(" %u", c.nightPct[l]);
     }
-    s.printf(" %%\ntmax %d °C, температура сейчас %d °C", c.tempMax, boardTempC() + NIGHT_TEMP_OFFSET_C);
+    s.printf(" %%, pwm %lu Гц\ntmax %d °C, температура сейчас %d °C", (unsigned long)c.nightPwmHz, c.tempMax,
+             boardTempC() + NIGHT_TEMP_OFFSET_C);
+    s.printf("\nдежурка: sb %u, sbpct", c.standbyLevel);
+    printValues(s, c.standbyPct, STANDBY_LEVEL_COUNT);
+    s.printf(" %%, sbon %u, sboff", c.standbyOnThreshold);
+    printValues(s, c.standbyOffThreshold, STANDBY_LEVEL_COUNT);
+    s.printf(", lightsb");
+    printValues(s, c.lightThresholdStandby, STANDBY_LEVEL_COUNT);
+    s.printf("; калибровка: темно с дежуркой");
+    printValues(s, c.lightStandbyLevel, STANDBY_LEVEL_COUNT);
 #endif
     if (c.ldrInputMode == LDR_NONE) {
         s.printf("\nldr 0: фоторезистора нет, свет не проверяется\n");
     } else {
-        s.printf("\nАЦП: свет сейчас %u, light %u, ldr %u\n", boardLight(), c.lightThreshold, c.ldrInputMode);
+        s.printf("\nАЦП: свет сейчас %u, light %u, ldr %u; калибровка: темно %u, светло %u\n", boardLight(),
+                 c.lightThreshold, c.ldrInputMode, c.lightDarkLevel, c.lightLitLevel);
     }
+    s.printf("залипание: stuck %u мин, stuckpct %u %%, stuckdb %u дБ\n", c.stuckMinutes, c.stuckLightPct,
+             c.stuckDeltaDb);
     s.printf("ворота: trig / hold\n");
     for (uint8_t g = 0; g < SENSOR_GATES; g++) {
         s.printf("%2u: %lu / %lu\n", g, (unsigned long)c.trig[g], (unsigned long)c.hold[g]);
     }
+}
+
+// sens W V: общий параметр датчика W (табл. 2-2) = V - сразу в датчик, для опытов; в настройки прибора не сохраняется.
+static void sensorParam(Stream& s, uint16_t word, uint32_t value) {
+    ldBegin(boardSensorBegin());
+    const bool ok = ldEnableConfig() && ldWriteParam(word, value);
+    s.printf("датчик: слово %u = %lu - %s\n", word, (unsigned long)value, ok ? "принято" : ldLastError());
+    ldEndConfig();
+    boardSensorEnd();
 }
 
 // Диагностика датчика: приём отчётов DIAG_REPORTS_MS (линия OT1 -> GP1), ответ на команды (GP0 -> RX), пороги.
@@ -162,17 +211,36 @@ static void sensorDiag(Stream& s) {
 
 // Монитор до любой клавиши: смена OT2 и кнопки - сразу, строка состояния - раз в MONITOR_PRINT_MS.
 static void monitor(Stream& s) {
+    delay(CONSOLE_FLUSH_MS);   // остаток конца строки команды (\r\n) - не принять за клавишу выхода
+    while (s.read() >= 0) {
+    }
     ldBegin(boardSensorBegin());
+    const bool standard = ldEnableConfig() && ldSetStandardMode(true);   // энергии ворот - для подбора stuckdb
+    ldEndConfig();
     LdReport r;                  // последний отчёт датчика
     uint16_t reports = 0;        // отчётов с последней строки состояния
     bool ot2 = boardPresence();  // OT2 в прошлом опросе
     bool btn = boardButton();    // кнопка BOOT в прошлом опросе
     uint32_t printMs = millis() - MONITOR_PRINT_MS;   // время последней строки состояния (millis)
-    s.printf("монитор, выход - любая клавиша\n");
+    float secDb = 0;             // самая большая энергия ворот с последней строки, дБ
+    uint8_t secGate = 0;         // её ворота
+    float peaks[MONITOR_PEAK_LINES] = {};   // secDb последних строк - пик за STUCK_BASELINE_MS, как фон залипания
+    uint8_t peakAt = 0;          // куда писать следующий secDb
+    s.printf("монитор, выход - любая клавиша%s\n", standard ? "" : " (стандартный отчёт не включился - без энергий)");
     while (s.read() < 0) {
         const uint32_t now = millis();
         while (ldPoll(r)) {
             reports++;
+            if (r.type != 1) {
+                continue;
+            }
+            for (uint8_t g = 0; g < SENSOR_GATES; g++) {
+                const float db = r.energy[g] > 0 ? ENERGY_DB_SCALE * log10f((float)r.energy[g]) : 0.0f;   // дБ
+                if (db > secDb) {
+                    secDb = db;
+                    secGate = g;
+                }
+            }
         }
         if (boardPresence() != ot2 || boardButton() != btn) {
             btn = boardButton();
@@ -185,19 +253,93 @@ static void monitor(Stream& s) {
             if (reports) {
                 s.printf(" (%s, %u см)", r.present ? "человек" : "никого", r.distanceCm);
             }
+            if (standard) {
+                peaks[peakAt] = secDb;
+                peakAt = (uint8_t)((peakAt + 1) % MONITOR_PEAK_LINES);
+                float peak = 0;   // пик за последние MONITOR_PEAK_LINES строк, дБ
+                for (uint8_t i = 0; i < MONITOR_PEAK_LINES; i++) {
+                    peak = peaks[i] > peak ? peaks[i] : peak;
+                }
+                s.printf(", энергия макс. ворота %u: %.1f дБ, пик за %lu с %.1f дБ", secGate, secDb,
+                         (unsigned long)(STUCK_BASELINE_MS / 1000), peak);
+            }
             s.printf("\n");
             reports = 0;
+            secDb = 0;
         }
         delay(USB_POLL_MS);
+    }
+    if (standard) {   // вернуть минимальный отчёт - как в работе
+        ldEnableConfig();
+        ldSetStandardMode(false);
+        ldEndConfig();
     }
     boardSensorEnd();
 }
 
+#ifdef NIGHT_LIGHT
+// pct, sbpct, sboff, lightsb: значения всех уровней одной строкой через пробел. true - ровно count чисел lo..hi
+// (в v, не больше NIGHT_LEVEL_COUNT); иначе - неверная команда.
+static bool parseValues(const char* line, unsigned long* v, uint8_t count, unsigned long lo, unsigned long hi) {
+    const char* p = line + strspn(line, " \t");     // начало слова команды
+    p += strcspn(p, " \t");                         // за словом команды
+    for (uint8_t l = 0; l < count; l++) {
+        char* end;                                  // за числом
+        v[l] = strtoul(p, &end, 10);
+        if (end == p || v[l] < lo || v[l] > hi) {
+            return false;
+        }
+        p = end;
+    }
+    return p[strspn(p, " \t\r\n")] == '\0';   // без лишних чисел и символов
+}
+
+// Принятые значения - в поле настроек (уровни яркости, пороги).
+template <typename T>
+static void copyValues(T* out, const unsigned long* v, uint8_t count) {
+    for (uint8_t l = 0; l < count; l++) {
+        out[l] = (T)v[l];
+    }
+}
+static_assert(STANDBY_LEVEL_COUNT <= NIGHT_LEVEL_COUNT, "parseValues: буфер - на NIGHT_LEVEL_COUNT значений");
+#endif
+
+// Пороги строкой из групп «G: T / H» (ворота: срабатывания / удержания) - одна группа или несколько подряд: вставка
+// вывода show / sensor (терминал может склеить строки в одну). Возвращает число групп (тогда пороги записаны в c);
+// 0 - в строке не только такие группы или ворота больше 15, пороги не меняются.
+static uint8_t parseThresholds(const char* line, Calib& c) {
+    uint32_t trig[SENSOR_GATES];   // пороги срабатывания после строки
+    uint32_t hold[SENSOR_GATES];   // пороги удержания после строки
+    memcpy(trig, c.trig, sizeof(trig));
+    memcpy(hold, c.hold, sizeof(hold));
+    uint8_t groups = 0;            // принятых групп
+    const char* p = line;          // разбор строки
+    while (*(p += strspn(p, " \t")) != '\0') {
+        unsigned long g = 0, t = 0, h = 0;   // ворота, срабатывание, удержание
+        int used = 0;                        // символов группы
+        if (sscanf(p, "%lu : %lu / %lu%n", &g, &t, &h, &used) != 3 || g >= SENSOR_GATES || groups == UINT8_MAX) {
+            return 0;
+        }
+        trig[g] = t;
+        hold[g] = h;
+        p += used;
+        groups++;
+    }
+    if (groups) {
+        memcpy(c.trig, trig, sizeof(trig));
+        memcpy(c.hold, hold, sizeof(hold));
+    }
+    return groups;
+}
+
 // Выполнить строку команды; false - выйти из консоли (calib = true - и запустить калибровку).
 static bool execute(Stream& s, Calib& c, const char* line, bool& calib) {
-    char cmd[8] = "";            // слово команды
+    char cmd[12] = "";           // слово команды (самое длинное - stuckpct)
     unsigned long a = 0, b = 0;  // числовые аргументы
-    const int n = sscanf(line, "%7s %lu %lu", cmd, &a, &b);
+    const int n = sscanf(line, "%11s %lu %lu", cmd, &a, &b);
+#ifdef NIGHT_LIGHT
+    unsigned long list[NIGHT_LEVEL_COUNT];   // значения уровней строкой (pct, sbpct, sboff, lightsb)
+#endif
     if (!strcmp(cmd, "exit")) {
         return false;
     }
@@ -231,14 +373,21 @@ static bool execute(Stream& s, Calib& c, const char* line, bool& calib) {
         sensorDiag(s);
         return true;
     }
+    if (n == 3 && !strcmp(cmd, "sens") && a <= UINT16_MAX) {
+        sensorParam(s, (uint16_t)a, b);
+        return true;
+    }
     if (!strcmp(cmd, "mon")) {
         monitor(s);
         return true;
     }
 #ifdef NIGHT_LIGHT
-    if (n == 2 && !strcmp(cmd, "on") && a <= NIGHT_PWM_RANGE) {
-        boardConsoleLamp((uint8_t)a);
-        s.printf("ночник %lu %%\n", a);
+    if ((n == 2 || (n == 3 && b >= NIGHT_PWM_HZ_MIN && b <= NIGHT_PWM_HZ_MAX)) && !strcmp(cmd, "on") &&
+        a <= NIGHT_PWM_RANGE) {
+        const unsigned long hz = n == 3 ? b : c.nightPwmHz;   // частота ШИМ, Гц: не введена - из настройки pwm
+        boardLampFreq(hz);
+        boardLamp((uint8_t)a);
+        s.printf("ночник %lu %%, ШИМ %lu Гц\n", a, hz);
         return true;
     }
 #endif
@@ -253,6 +402,15 @@ static bool execute(Stream& s, Calib& c, const char* line, bool& calib) {
     } else if (n == 2 && !strcmp(cmd, "minon") && a <= UINT16_MAX) {
         c.minOnS = (uint16_t)a;
         ok = true;
+    } else if (n == 2 && !strcmp(cmd, "stuck") && a <= UINT16_MAX) {
+        c.stuckMinutes = (uint16_t)a;
+        ok = true;
+    } else if (n == 2 && !strcmp(cmd, "stuckpct") && a <= 100) {
+        c.stuckLightPct = (uint8_t)a;
+        ok = true;
+    } else if (n == 2 && !strcmp(cmd, "stuckdb") && a >= 1 && a <= STUCK_DELTA_DB_MAX) {
+        c.stuckDeltaDb = (uint8_t)a;
+        ok = true;
     } else if (n == 2 && !strcmp(cmd, "ldr") && a <= LDR_DARK_HIGH) {
         c.ldrInputMode = (LdrInputMode)a;
         ok = true;
@@ -262,18 +420,36 @@ static bool execute(Stream& s, Calib& c, const char* line, bool& calib) {
     } else if (n == 2 && !strcmp(cmd, "far") && a <= SENSOR_FAR_MAX) {
         c.farGate = (uint8_t)a;
         ok = true;
-    } else if (n == 3 && (!strcmp(cmd, "trig") || !strcmp(cmd, "hold")) && a < SENSOR_GATES) {
-        (cmd[0] == 't' ? c.trig : c.hold)[a] = b;
+    } else if (const uint8_t gates = parseThresholds(line, c)) {
+        s.printf("пороги ворот: %u\n", gates);
         ok = true;
 #ifdef NIGHT_LIGHT
     } else if (n == 2 && !strcmp(cmd, "level") && a < NIGHT_LEVEL_COUNT) {
         c.nightLevel = (uint8_t)a;
         ok = true;
-    } else if (n == 3 && !strcmp(cmd, "pct") && a < NIGHT_LEVEL_COUNT && b >= 1 && b <= NIGHT_PWM_RANGE) {
-        c.nightPct[a] = (uint8_t)b;
+    } else if (!strcmp(cmd, "pct") && parseValues(line, list, NIGHT_LEVEL_COUNT, 1, NIGHT_PWM_RANGE)) {
+        copyValues(c.nightPct, list, NIGHT_LEVEL_COUNT);
+        ok = true;
+    } else if (!strcmp(cmd, "sbpct") && parseValues(line, list, STANDBY_LEVEL_COUNT, 1, NIGHT_PWM_RANGE)) {
+        copyValues(c.standbyPct, list, STANDBY_LEVEL_COUNT);
+        ok = true;
+    } else if (n == 2 && !strcmp(cmd, "sb") && a <= STANDBY_LEVEL_COUNT) {
+        c.standbyLevel = (uint8_t)a;
+        ok = true;
+    } else if (n == 2 && !strcmp(cmd, "sbon") && a <= ADC_FULL) {
+        c.standbyOnThreshold = (uint16_t)a;
+        ok = true;
+    } else if (!strcmp(cmd, "sboff") && parseValues(line, list, STANDBY_LEVEL_COUNT, 0, ADC_FULL)) {
+        copyValues(c.standbyOffThreshold, list, STANDBY_LEVEL_COUNT);
+        ok = true;
+    } else if (!strcmp(cmd, "lightsb") && parseValues(line, list, STANDBY_LEVEL_COUNT, 0, ADC_FULL)) {
+        copyValues(c.lightThresholdStandby, list, STANDBY_LEVEL_COUNT);
         ok = true;
     } else if (n == 2 && !strcmp(cmd, "tmax") && a >= NIGHT_TMAX_MIN_C && a <= NIGHT_TMAX_MAX_C) {
         c.tempMax = (int8_t)a;
+        ok = true;
+    } else if (n == 2 && !strcmp(cmd, "pwm") && a >= NIGHT_PWM_HZ_MIN && a <= NIGHT_PWM_HZ_MAX) {
+        c.nightPwmHz = a;
         ok = true;
 #endif
     }

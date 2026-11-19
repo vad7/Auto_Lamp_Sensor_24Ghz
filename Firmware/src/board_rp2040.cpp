@@ -22,7 +22,8 @@ constexpr vreg_voltage CORE_VOLTAGE = VREG_VOLTAGE_1_05;   // ядро DVDD, м�
 // Такты в состоянии SLEEP: таймер и сторожевой таймер (тик 1 мкс для таймера) - табл. 250
 constexpr uint32_t SLEEP_EN1_MASK = CLOCKS_SLEEP_EN1_CLK_SYS_TIMER_BITS | CLOCKS_SLEEP_EN1_CLK_SYS_WATCHDOG_BITS;
 constexpr size_t   UART_FIFO_SIZE = 256;                   // программный буфер приёма UART, байт (кадр <= 80)
-constexpr float    PWM_CLKDIV_MAX = 255.0f;                // наибольший делитель ШИМ (целая часть делителя - 8 бит, формат 8.4)
+constexpr uint32_t PWM_CLKDIV_FRAC = 16;                   // делитель ШИМ - формат 8.4: дробная часть 1/16
+constexpr uint32_t PWM_COUNTS_MAX  = 65536;                // наибольший период счётчика ШИМ, отсчётов (16 бит)
 
 static Adafruit_NeoPixel s_led(1, PIN_LED, NEO_GRB + NEO_KHZ800);  // индикатор WS2812B (порядок GRB)
 static Led      s_ledMode = Led::Off;   // текущий режим индикатора
@@ -30,6 +31,7 @@ static bool     s_ledLit = false;       // мигание: светодиод с
 static uint32_t s_ledToggleMs = 0;      // время последнего переключения мигания (millis)
 #ifdef NIGHT_LIGHT
 static bool     s_lampPwm = false;      // идёт ШИМ ночника (0 < яркость < 100 %) - сон без остановки тактов
+static uint32_t s_pwmCounts = 0;        // отсчётов счётчика ШИМ на период (boardLampFreq); 0 - ШИМ не настроен
 #endif
 
 // USB выключить, системная и периферийная частоты - от кварца, PLL и неиспользуемые такты - выключить (не в отладке:
@@ -98,17 +100,25 @@ Stream* boardConsoleOpen() {
 
 #ifdef NIGHT_LIGHT
 // ШИМ напрямую через SDK, не analogWrite: тот запомнил бы делитель от тактов консоли (с ФАПЧ), а повторный
-// analogWriteFreq с той же частотой в boardInit делитель не пересчитывает. Делитель не больше 255 - на тактах
-// с ФАПЧ частота выше NIGHT_PWM_HZ; заполнение (яркость) то же. boardInit вернёт вывод в GPIO, ШИМ настроит заново.
-void boardConsoleLamp(uint8_t percent) {
+// analogWriteFreq с той же частотой после смены тактов делитель не пересчитывает. Делитель - наименьший, при котором
+// период влезает в 16-битный счётчик: шкала крупная, частота точная. Ночник гаснет (уровень 0).
+// boardInit возвращает вывод в GPIO - после него вызвать снова.
+void boardLampFreq(uint32_t hz) {
     const uint slice = pwm_gpio_to_slice_num(PIN_LAMP);   // блок ШИМ вывода лампы
+    const uint64_t clk16 = (uint64_t)clock_get_hz(clk_sys) * PWM_CLKDIV_FRAC;   // такт ШИМ x 16 (делитель 8.4)
+    const uint64_t maxPeriod = (uint64_t)hz * PWM_COUNTS_MAX;                   // частота x наибольший период счётчика
+    uint32_t div16 = (clk16 + maxPeriod - 1) / maxPeriod;                       // делитель x 16, округлён вверх
+    if (div16 < PWM_CLKDIV_FRAC) {
+        div16 = PWM_CLKDIV_FRAC;   // делитель не меньше 1
+    }
+    s_pwmCounts = clk16 / ((uint64_t)div16 * hz);
     pwm_config c = pwm_get_default_config();
-    pwm_config_set_clkdiv(&c, min(PWM_CLKDIV_MAX, (float)clock_get_hz(clk_sys) / (NIGHT_PWM_RANGE * NIGHT_PWM_HZ)));
-    pwm_config_set_wrap(&c, NIGHT_PWM_RANGE - 1);
+    pwm_config_set_clkdiv(&c, (float)div16 / PWM_CLKDIV_FRAC);
+    pwm_config_set_wrap(&c, s_pwmCounts - 1);
     pwm_init(slice, &c, true);
     gpio_set_drive_strength(PIN_LAMP, GPIO_DRIVE_STRENGTH_12MA);
     gpio_set_function(PIN_LAMP, GPIO_FUNC_PWM);
-    pwm_set_gpio_level(PIN_LAMP, percent);
+    boardLamp(0);
 }
 #endif
 
@@ -127,10 +137,6 @@ void boardInit() {
     // Светодиод MOC3043M напрямую с вывода: 12 мА - VOH >= 2,62 В (даташит RP2040, табл. GPIO, стр. 616);
     // ночнику - быстрее перезаряжать затвор P75N02LDG
     gpio_set_drive_strength(PIN_LAMP, GPIO_DRIVE_STRENGTH_12MA);
-#ifdef NIGHT_LIGHT
-    analogWriteFreq(NIGHT_PWM_HZ);      // после clocksLowPower: делитель считается от clk_sys
-    analogWriteRange(NIGHT_PWM_RANGE);
-#endif
     adc_gpio_init(PIN_LIGHT);
     adc_gpio_init(PIN_SUPPLY);
     s_led.begin();
@@ -164,7 +170,7 @@ bool boardPresence() {
 
 void boardLamp(uint8_t percent) {
 #ifdef NIGHT_LIGHT
-    analogWrite(PIN_LAMP, percent);
+    pwm_set_gpio_level(PIN_LAMP, s_pwmCounts * percent / NIGHT_PWM_RANGE);   // s_pwmCounts - 100 %: выход 1 постоянно
     s_lampPwm = percent > 0 && percent < NIGHT_PWM_RANGE;
 #else
     digitalWrite(PIN_LAMP, percent ? HIGH : LOW);
@@ -213,11 +219,22 @@ void boardLed(Led led) {
     s_ledMode = led;
     s_ledLit = (led != Led::Off);
     s_ledToggleMs = millis();
-    ledShow(led == Led::Red || led == Led::CalLeave || led == Led::NoSensor || led == Led::SupplyFault ? LED_LEVEL : 0,
-            led == Led::Green ? LED_LEVEL : 0, led == Led::Blue ? LED_LEVEL : 0);
+    const bool white = led == Led::StuckFlash;   // залипание: белый (все три цвета)
+    ledShow(led == Led::Red || led == Led::CalLeave || led == Led::NoSensor || led == Led::SupplyFault || white ?
+            LED_LEVEL : 0, led == Led::Green || white ? LED_LEVEL : 0, led == Led::Blue || white ? LED_LEVEL : 0);
 }
 
 void boardLedTick(uint32_t now) {
+    if (s_ledMode == Led::StuckFlash) {   // короткая вспышка, длинная пауза
+        if (now - s_ledToggleMs < (s_ledLit ? LED_STUCK_FLASH_MS : LED_STUCK_PERIOD_MS - LED_STUCK_FLASH_MS)) {
+            return;
+        }
+        s_ledToggleMs = now;
+        s_ledLit = !s_ledLit;
+        const uint8_t v = s_ledLit ? LED_LEVEL : 0;   // яркость каждого цвета белой вспышки
+        ledShow(v, v, v);
+        return;
+    }
     const uint32_t half = s_ledMode == Led::SupplyFault ? LED_SUPPLY_FAULT_MS : LED_BLINK_MS;
     if ((s_ledMode != Led::NoSensor && s_ledMode != Led::SupplyFault && s_ledMode != Led::CalLeave) ||
         now - s_ledToggleMs < half) {
